@@ -177,14 +177,50 @@ def create_forecast(df):
         return None
 
 def create_year_over_year_chart(df):
-    """Create year over year chart showing incident counts by year"""
+    """Create year over year chart showing incident counts by year with current year projection"""
+    from datetime import datetime
+    
     df['year'] = df['incident_occurred_at'].dt.year
     yearly_counts = df.groupby('year').size().reset_index(name='count')
     
+    # Get current year and check if we have enough data for projection
+    current_year = datetime.now().year
+    current_year_data = df[df['year'] == current_year]
+    
+    # Create base bar chart
     fig = px.bar(yearly_counts, x='year', y='count',
                  title='Year over Year Incident Count',
                  labels={'year': 'Year', 'count': 'Number of Incidents'})
-    fig.update_layout(height=600)
+    
+    # Add projection for current year if we have at least 2 months of data
+    if len(current_year_data) > 0:
+        # Calculate days elapsed in current year
+        current_date = datetime.now()
+        start_of_year = datetime(current_year, 1, 1)
+        days_elapsed = (current_date - start_of_year).days
+        
+        # Check if we have at least 2 months of data (approximately 60 days)
+        if days_elapsed >= 60:
+            # Calculate projection
+            incidents_so_far = len(current_year_data)
+            days_in_year = 366 if current_year % 4 == 0 else 365  # Account for leap year
+            projected_total = incidents_so_far * (days_in_year / days_elapsed)
+            
+            # Add transparent bar for projection (above current year's actual count)
+            current_count = yearly_counts[yearly_counts['year'] == current_year]['count'].iloc[0] if current_year in yearly_counts['year'].values else 0
+            projection_height = projected_total - current_count
+            
+            if projection_height > 0:
+                fig.add_bar(
+                    x=[current_year],
+                    y=[projection_height],
+                    base=[current_count],
+                    name='Projected (End of Year)',
+                    marker_color='rgba(255, 165, 0, 0.3)',
+                    showlegend=True
+                )
+    
+    fig.update_layout(height=600, barmode='overlay')
     return fig
 
 def create_offense_category_chart(df):
