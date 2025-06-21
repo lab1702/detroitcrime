@@ -176,6 +176,17 @@ def create_forecast(df):
         st.error(f"Error creating forecast: {str(e)}")
         return None
 
+def create_year_over_year_chart(df):
+    """Create year over year chart showing incident counts by year"""
+    df['year'] = df['incident_occurred_at'].dt.year
+    yearly_counts = df.groupby('year').size().reset_index(name='count')
+    
+    fig = px.bar(yearly_counts, x='year', y='count',
+                 title='Year over Year Incident Count',
+                 labels={'year': 'Year', 'count': 'Number of Incidents'})
+    fig.update_layout(height=600)
+    return fig
+
 def create_offense_category_chart(df):
     """Create chart showing distribution of offense categories"""
     offense_counts = df['offense_category'].value_counts().head(10)
@@ -233,7 +244,7 @@ def main():
             st.metric("Most Common", most_common)
     
     # Main content tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Map", "Time Series", "Heatmaps", "Forecast", "Categories"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Map", "Time Series", "Year over Year", "Heatmaps", "Forecast", "Categories"])
     
     with tab1:
         st.subheader("Crime Incident Map")
@@ -252,6 +263,14 @@ def main():
             st.warning("No data available for selected filters")
     
     with tab3:
+        st.subheader("Year over Year Incident Count")
+        if not df_filtered.empty:
+            yoy_fig = create_year_over_year_chart(df_filtered)
+            st.plotly_chart(yoy_fig, use_container_width=True)
+        else:
+            st.warning("No data available for selected filters")
+    
+    with tab4:
         st.subheader("Day of Week vs Hour of Day Heatmap")
         if not df_filtered.empty:
             heatmap_fig = create_day_of_week_heatmap(df_filtered)
@@ -259,7 +278,7 @@ def main():
         else:
             st.warning("No data available for selected filters")
     
-    with tab4:
+    with tab5:
         st.subheader("1-Year Incident Forecast")
         if not df_filtered.empty:
             forecast_fig = create_forecast(df_filtered)
@@ -268,7 +287,7 @@ def main():
         else:
             st.warning("No data available for forecasting")
     
-    with tab5:
+    with tab6:
         st.subheader("Crime Categories")
         if selected_category != 'All':
             st.info("Select 'All' in the offense category filter to view the top 10 crime categories chart.")
