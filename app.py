@@ -78,7 +78,7 @@ def create_time_series_chart(df):
     fig = px.line(daily_counts, x='date', y='count', 
                   title='Daily Crime Incident Count',
                   labels={'date': 'Date', 'count': 'Number of Incidents'})
-    fig.update_layout(height=400)
+    fig.update_layout(height=800)
     return fig
 
 def create_day_of_week_heatmap(df):
@@ -98,7 +98,7 @@ def create_day_of_week_heatmap(df):
                     color_continuous_scale="Reds")
     
     fig.update_yaxes(tickvals=list(range(1, 8)), ticktext=day_labels)
-    fig.update_layout(height=400)
+    fig.update_layout(height=800)
     return fig
 
 def create_forecast(df):
@@ -187,7 +187,7 @@ def create_offense_category_chart(df):
         title='Top 10 Crime Categories',
         labels={'x': 'Number of Incidents', 'y': 'Offense Category'}
     )
-    fig.update_layout(height=400)
+    fig.update_layout(height=800)
     return fig
 
 def main():
