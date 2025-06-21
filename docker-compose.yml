@@ -1,0 +1,8 @@
+services:
+  detroit-crime-app:
+    build: .
+    ports:
+      - "8502:8501"
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
