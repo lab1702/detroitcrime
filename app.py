@@ -46,6 +46,25 @@ def load_data():
             st.error(f"Error loading data: {str(e)}")
             return None
 
+@st.cache_data
+def filter_map_data(df, selected_category):
+    """Filter data to show only the most recent rolling 1 year for the map"""
+    if df is None or len(df) == 0:
+        return df
+    
+    # Apply category filter first if needed
+    if selected_category != 'All':
+        df = df[df['offense_category'] == selected_category]
+    
+    # Find the most recent date in the dataset
+    most_recent_date = df['date'].max()
+    
+    # Calculate one year ago from the most recent date
+    one_year_ago = (pd.to_datetime(most_recent_date) - pd.DateOffset(years=1)).date()
+    
+    # Filter for most recent rolling 1 year
+    return df[df['date'] >= one_year_ago]
+
 def create_map(df, sample_size=1000):
     """Create interactive map of crime incidents"""
     # Sample data for performance
@@ -100,6 +119,7 @@ def create_day_of_week_heatmap(df):
     fig.update_layout(height=600)
     return fig
 
+@st.cache_data(ttl=3600)
 def create_forecast(df):
     """Create Prophet forecast for incident count"""
     try:
@@ -242,6 +262,7 @@ def create_forecast(df):
         st.error(f"Error creating forecast: {str(e)}")
         return None
 
+@st.cache_data(ttl=1800)
 def create_year_over_year_chart(df):
     """Create year over year chart showing incident counts by year with current year projection"""
     from datetime import datetime
@@ -347,10 +368,16 @@ def main():
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Map", "Time Series", "Year over Year", "Heatmaps", "Forecast", "Categories"])
     
     with tab1:
-        st.subheader("Crime Incident Map")
-        if not df_filtered.empty:
-            map_obj = create_map(df_filtered)
-            st_folium(map_obj, width=1000, height=600)
+        if not df.empty:
+            # Filter to show only most recent 1 year for the map
+            df_map = filter_map_data(df, selected_category)
+            incident_count = len(df_map) if not df_map.empty else 0
+            st.subheader(f"Crime Incident Map (Most Recent Rolling Year - {incident_count:,} incidents)")
+            if not df_map.empty:
+                map_obj = create_map(df_map)
+                st_folium(map_obj, width=1000, height=600, key="crime_map")
+            else:
+                st.warning("No data available for the most recent 1 year with selected filters")
         else:
             st.warning("No data available for selected filters")
     
