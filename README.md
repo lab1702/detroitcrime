@@ -4,14 +4,22 @@ An interactive web application for visualizing and analyzing Detroit crime incid
 
 ## Features
 
-- **Interactive Map**: View crime incidents plotted on an interactive map of Detroit with detailed popups
+- **Crime Categories**: Top 10 crime categories and offense descriptions analysis
+- **Case Status Analysis**: Distribution of case statuses (Active, Inactive, Cleared by Arrest)
+- **Year over Year Analysis**: Annual incident trends with current year projections
 - **Time Series Analysis**: Historical incident count trends by day
-- **Heat Maps**: Crime patterns by day of week and hour of day
-- **Forecasting**: 1-year crime incident forecast using Facebook Prophet
-- **Category Analysis**: Top 10 crime categories visualization
+- **Temporal Heat Maps**: Crime patterns by day of week and hour of day
+- **Geographic Analysis**: 
+  - Top 10 zip codes by incident count
+  - Police precinct analysis
+  - Council district analysis
+  - Neighborhood analysis
+  - Location analysis by nearest intersection
+- **Forecasting**: 1-year crime incident forecast using Facebook Prophet with holiday support
+- **Pivot Analysis**: Interactive pivot table analysis with customizable rows/columns
 - **Real-time Data**: Automatically fetches latest data from Detroit Open Data Portal
-- **Filtering**: Filter data by offense category
-- **Performance Optimized**: Data caching and sampling for optimal performance
+- **Filtering**: Filter all analyses by offense category
+- **Performance Optimized**: Multi-level caching system for optimal performance
 
 ## Tech Stack
 
@@ -19,10 +27,9 @@ An interactive web application for visualizing and analyzing Detroit crime incid
 - **Streamlit**: Web application framework
 - **Pandas**: Data manipulation and analysis
 - **Plotly**: Interactive visualizations
-- **Folium**: Interactive maps
-- **Prophet**: Time series forecasting
+- **Prophet**: Time series forecasting with holiday support
 - **NumPy**: Numerical computing
-- **Seaborn/Matplotlib**: Additional plotting capabilities
+- **Requests**: HTTP library for data fetching
 
 ## Data Source
 
@@ -44,7 +51,7 @@ The application fetches real-time crime incident data from the Detroit Open Data
 1. Clone the repository:
 ```bash
 git clone <repository-url>
-cd detroitcrime_app
+cd detroitcrime
 ```
 
 2. Create a virtual environment:
@@ -77,8 +84,10 @@ The application will be available at `http://localhost:8502`
 ## Application Structure
 
 ```
-detroitcrime_app/
-├── app.py                 # Main Streamlit application
+detroitcrime/
+├── app.py                 # Main Streamlit application (12 tabs)
+├── constants.py           # Configuration constants and parameters
+├── utils.py              # Utility functions for data processing
 ├── requirements.txt       # Python dependencies
 ├── Dockerfile            # Docker configuration
 ├── docker-compose.yml    # Docker Compose configuration
@@ -95,31 +104,32 @@ detroitcrime_app/
 - Cleans and filters data for quality
 - Removes invalid coordinates and recent incomplete data
 
-### Visualizations
+### Application Tabs
 
-1. **Interactive Map** (`create_map()`):
-   - Folium-based map centered on Detroit
-   - Circle markers for each incident
-   - Popup details with offense type, location, and timestamp
-   - Sampling for performance (max 1000 incidents displayed)
+The dashboard features 12 interactive tabs:
 
-2. **Time Series Chart** (`create_time_series_chart()`):
-   - Daily incident count over time
-   - Plotly line chart with interactive features
+1. **Categories**: Crime category analysis with drill-down to offense descriptions
+2. **Case Status**: Distribution of case statuses across incidents
+3. **Year over Year**: Annual trends with current year projections
+4. **Daily Incidents**: Time series of daily incident counts
+5. **Hour of Day of Week**: Temporal pattern heatmap
+6. **Zip Codes**: Geographic analysis by zip code
+7. **Police Precincts**: Analysis by police precinct
+8. **Council Districts**: Analysis by council district
+9. **Neighborhoods**: Neighborhood-level analysis
+10. **Locations**: Analysis by nearest intersection
+11. **Forecast**: 1-year Prophet forecast with holiday annotations
+12. **Pivot Analysis**: Interactive pivot table with customizable dimensions
 
-3. **Heat Map** (`create_day_of_week_heatmap()`):
-   - Day of week vs hour of day analysis
-   - Shows crime patterns by time
-   - Color-coded intensity visualization
+### Advanced Features
 
-4. **Forecasting** (`create_forecast()`):
-   - Facebook Prophet model for 1-year predictions
-   - Confidence intervals included
-   - Requires minimum 30 days of historical data
-
-5. **Category Analysis** (`create_offense_category_chart()`):
-   - Top 10 crime categories by incident count
-   - Horizontal bar chart for easy comparison
+- **Smart Caching**: Multi-level caching (24h for data, 1h for forecast, 30min for YoY)
+- **Holiday Support**: Forecast includes US holiday annotations and effects
+- **Current Year Projections**: Automatic projection based on year-to-date data
+- **Categorical Formatting**: Proper handling of zip codes, precincts, and districts
+- **Data Validation**: Comprehensive validation and error handling
+- **Type Safety**: Full type hint coverage for maintainability
+- **Modular Architecture**: Separated constants, utilities, and main application
 
 ### Data Filtering
 - Offense category filter in sidebar
@@ -128,10 +138,14 @@ detroitcrime_app/
 
 ## Performance Optimizations
 
-- **Data Caching**: 24-hour TTL cache for API data
-- **Map Sampling**: Limits map markers to 1000 for performance
-- **Efficient Data Processing**: Optimized pandas operations
-- **Error Handling**: Graceful handling of API failures and data issues
+- **Multi-level Caching**: Different TTL values for different data types
+  - Data loading: 24 hours
+  - Forecasting: 1 hour
+  - Year-over-year analysis: 30 minutes
+- **Efficient Data Processing**: Utility functions for common operations
+- **Categorical Optimization**: Specialized handling for geographic identifiers
+- **Error Handling**: Specific exception handling with user-friendly messages
+- **Memory Management**: Optimized DataFrame operations and copying
 
 ## Environment Variables
 
@@ -154,15 +168,21 @@ The application implements several data quality measures:
 - Responsive design with wide layout configuration
 - Modular code structure for maintainability
 
-## Future Enhancements
+## Architecture & Code Quality
 
-Potential improvements could include:
-- Additional crime type analyses
-- Neighborhood-specific filtering
-- Seasonal pattern analysis
-- Crime hotspot identification
-- Export functionality for data and visualizations
-- Mobile-responsive design improvements
+### File Structure
+- **app.py**: Main Streamlit application with comprehensive type hints
+- **constants.py**: Centralized configuration and magic numbers
+- **utils.py**: Reusable utility functions for data processing
+- **requirements.txt**: Pinned dependencies for security and stability
+
+### Best Practices Implemented
+- **Type Safety**: Full type hint coverage
+- **Error Handling**: Specific exception handling patterns
+- **Code Organization**: Clear separation of concerns
+- **Documentation**: Comprehensive docstrings and comments
+- **Performance**: Optimized caching and data processing
+- **Security**: Input validation and proper dependency management
 
 ## License
 

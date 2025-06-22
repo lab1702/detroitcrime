@@ -47,8 +47,31 @@
 - **Crime Type**: `offense_category`, `offense_description`
 - **Geographic**: `police_precinct`, `council_district`, `zip_code`
 
+## Application Data Requirements
+
+The application requires the following columns for proper functionality:
+- `latitude`, `longitude` - Geographic coordinates
+- `incident_occurred_at` - Date/time information
+- `incident_entry_id` - Unique identifier for counting
+- `offense_category`, `offense_description` - Crime classification
+- `case_status` - Case status information
+- `police_precinct`, `council_district`, `neighborhood` - Geographic divisions
+- `zip_code`, `nearest_intersection` - Location details
+- `incident_day_of_week`, `incident_hour_of_day` - Temporal analysis
+
+## Data Processing & Filtering
+
+The application implements several data quality measures:
+- **Geographic Filtering**: Latitude (42.0-43.0), Longitude (-84.0 to -82.0)
+- **Temporal Filtering**: Data from 2018-01-01 onwards
+- **Quality Control**: Removes records with missing coordinates or invalid values
+- **Real-time Exclusion**: Excludes most recent date to avoid incomplete data
+- **Categorical Formatting**: Special handling for zip codes, precincts, and districts
+
 ## Data Quality Notes
 
 - Some records may have missing coordinates (empty X, Y values)
 - Incidents span multiple years (2017-2025 based on sample)
 - Real-time data with recent incidents marked as "ACTIVE"
+- Application validates data structure on load
+- Comprehensive error handling for data quality issues
