@@ -3,8 +3,9 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import folium
-from streamlit_folium import folium_static
+from streamlit_folium import st_folium
 from prophet import Prophet
+from prophet.make_holidays import make_holidays_df
 from datetime import datetime
 
 # Configure page
@@ -15,14 +16,14 @@ st.set_page_config(
 )
 
 # Cache for 24 hours (86400 seconds)
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=86400, show_spinner=False)
 def load_data():
     """Load Detroit crime data with 24-hour caching"""
     url = "https://data.detroitmi.gov/api/download/v1/items/8e532daeec1149879bd5e67fdd9c8be0/csv?layers=0"
     
-    with st.spinner("Loading Detroit crime data..."):
+    with st.spinner("Downloading Detroit crime data..."):
         try:
-            df = pd.read_csv(url)
+            df = pd.read_csv(url, low_memory=False)
             
             # Clean and prepare data
             df = df.dropna(subset=['latitude', 'longitude'])
@@ -76,7 +77,6 @@ def create_time_series_chart(df):
     daily_counts['date'] = pd.to_datetime(daily_counts['date'])
     
     fig = px.line(daily_counts, x='date', y='count', 
-                  title='Daily Crime Incident Count',
                   labels={'date': 'Date', 'count': 'Number of Incidents'})
     fig.update_layout(height=600)
     return fig
@@ -92,7 +92,6 @@ def create_day_of_week_heatmap(df):
     day_labels = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
     
     fig = px.imshow(pivot_data, 
-                    title='Crime Incidents Heatmap: Day of Week vs Hour of Day',
                     labels=dict(x="Hour of Day", y="Day of Week", color="Incident Count"),
                     aspect="auto",
                     color_continuous_scale="Reds")
@@ -114,8 +113,13 @@ def create_forecast(df):
             st.warning("Not enough historical data for reliable forecasting (minimum 30 days required)")
             return None
         
-        # Create and fit model
-        model = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=True)
+        # Create holidays dataframe for US holidays
+        holidays = make_holidays_df(year_list=list(range(daily_counts['ds'].dt.year.min(), 
+                                                        daily_counts['ds'].dt.year.max() + 2)), 
+                                  country='US')
+        
+        # Create and fit model with holidays
+        model = Prophet(holidays=holidays)
         model.fit(daily_counts)
         
         # Make future dataframe for 1 year (365 days)
@@ -125,10 +129,14 @@ def create_forecast(df):
         # Create forecast plot
         fig = go.Figure()
         
-        # Historical data
+        # Historical data - only show last 1 year before forecast
+        forecast_start = daily_counts['ds'].max()
+        one_year_before = forecast_start - pd.DateOffset(years=1)
+        historical_data = daily_counts[daily_counts['ds'] >= one_year_before]
+        
         fig.add_trace(go.Scatter(
-            x=daily_counts['ds'], 
-            y=daily_counts['y'],
+            x=historical_data['ds'], 
+            y=historical_data['y'],
             mode='markers',
             name='Historical Data',
             marker=dict(color='blue', size=4)
@@ -164,8 +172,66 @@ def create_forecast(df):
             fillcolor='rgba(255,0,0,0.2)'
         ))
         
+        # Add holiday annotations
+        # Filter holidays to show only those in the forecast period
+        forecast_start = daily_counts['ds'].max()
+        forecast_end = future_dates['ds'].max()
+        forecast_holidays = holidays[
+            (holidays['ds'] >= forecast_start) & 
+            (holidays['ds'] <= forecast_end)
+        ]
+        
+        # Add vertical lines and annotations for major holidays
+        if not forecast_holidays.empty:
+            y_max = future_dates['yhat'].max()
+            y_min = future_dates['yhat'].min()
+            y_range = y_max - y_min
+            
+            # Sort holidays by date to better handle spacing
+            forecast_holidays = forecast_holidays.sort_values('ds')
+            
+            # Use simple alternating levels to prevent overlaps
+            for i, (_, holiday) in enumerate(forecast_holidays.iterrows()):
+                holiday_date = holiday['ds']
+                holiday_name = holiday['holiday']
+                
+                # Add vertical line for holiday
+                fig.add_vline(
+                    x=holiday_date,
+                    line_dash="dash",
+                    line_color="rgba(100, 200, 100, 0.6)",
+                    line_width=1
+                )
+                
+                # Simple alternating levels - each holiday gets a different level
+                level = i % 4  # Rotate through 4 levels
+                
+                # Calculate position based on level
+                y_position = y_max - (y_range * 0.1) - level * (y_range * 0.25)
+                arrow_direction = -25 - level * 25
+                
+                # Truncate long holiday names
+                display_name = holiday_name if len(holiday_name) <= 12 else holiday_name[:9] + "..."
+                
+                # Add annotation for holiday name with better styling
+                fig.add_annotation(
+                    x=holiday_date,
+                    y=y_position,
+                    text=display_name,
+                    showarrow=True,
+                    arrowhead=1,
+                    arrowsize=0.7,
+                    arrowwidth=1,
+                    arrowcolor="rgba(100, 200, 100, 0.8)",
+                    ax=0,
+                    ay=arrow_direction,
+                    bgcolor="rgba(50, 50, 50, 0.9)",
+                    bordercolor="rgba(100, 200, 100, 0.8)",
+                    borderwidth=1,
+                    font=dict(size=8, color="white")
+                )
+        
         fig.update_layout(
-            title='1-Year Crime Incident Forecast',
             xaxis_title='Date',
             yaxis_title='Incident Count',
             height=600
@@ -189,7 +255,6 @@ def create_year_over_year_chart(df):
     
     # Create base bar chart
     fig = px.bar(yearly_counts, x='year', y='count',
-                 title='Year over Year Incident Count',
                  labels={'year': 'Year', 'count': 'Number of Incidents'})
     
     # Add projection for current year if we have at least 2 months of data
@@ -231,7 +296,6 @@ def create_offense_category_chart(df):
         x=offense_counts.values[::-1],
         y=offense_counts.index[::-1],
         orientation='h',
-        title='Top 10 Crime Categories',
         labels={'x': 'Number of Incidents', 'y': 'Offense Category'}
     )
     fig.update_layout(height=600)
@@ -286,7 +350,7 @@ def main():
         st.subheader("Crime Incident Map")
         if not df_filtered.empty:
             map_obj = create_map(df_filtered)
-            folium_static(map_obj, width=1000, height=600)
+            st_folium(map_obj, width=1000, height=600)
         else:
             st.warning("No data available for selected filters")
     
