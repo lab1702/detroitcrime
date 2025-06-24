@@ -74,6 +74,13 @@ def create_time_series_chart(df):
     daily_counts = df.groupby('date').size().reset_index(name='count')
     daily_counts['date'] = pd.to_datetime(daily_counts['date'])
     
+    # Fill missing dates with zero counts
+    date_range = pd.date_range(start=daily_counts['date'].min(), 
+                              end=daily_counts['date'].max(), 
+                              freq='D')
+    complete_dates = pd.DataFrame({'date': date_range})
+    daily_counts = complete_dates.merge(daily_counts, on='date', how='left').fillna(0)
+    
     fig = px.line(daily_counts, x='date', y='count', 
                   labels={'date': 'Date', 'count': 'Number of Incidents'})
     fig.update_layout(height=CHART_HEIGHT)
@@ -107,6 +114,13 @@ def create_forecast(df: pd.DataFrame) -> Optional[go.Figure]:
         daily_counts = df.groupby('date').size().reset_index()
         daily_counts.columns = ['ds', 'y']
         daily_counts['ds'] = pd.to_datetime(daily_counts['ds'])
+        
+        # Fill missing dates with zero counts
+        date_range = pd.date_range(start=daily_counts['ds'].min(), 
+                                  end=daily_counts['ds'].max(), 
+                                  freq='D')
+        complete_dates = pd.DataFrame({'ds': date_range})
+        daily_counts = complete_dates.merge(daily_counts, on='ds', how='left').fillna(0)
         
         # Ensure we have enough data points
         if len(daily_counts) < 30:
