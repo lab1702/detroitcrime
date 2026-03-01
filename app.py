@@ -100,30 +100,14 @@ def compute_yoy_deltas(df_filtered: pd.DataFrame):
     return incidents_delta, avg_delta
 
 
-def main() -> None:
-    """Load data, populate session state for child pages, and render Overview."""
-    df = load_data()
-    if df is None:
-        st.error("Failed to load data. Please try again later.")
-        return
+def overview_page() -> None:
+    """Render the Overview page content."""
+    df_filtered = st.session_state.get("df_filtered")
+    selected_category = st.session_state.get("selected_category", "All")
 
-    selected_category = setup_sidebar(df)
-
-    # Filter data
-    if selected_category == "All":
-        df_filtered = df
-    else:
-        df_filtered = df[df["offense_category"] == selected_category]
-
-    # Store in session state for child pages
-    st.session_state["df"] = df
-    st.session_state["df_filtered"] = df_filtered
-    st.session_state["selected_category"] = selected_category
-
-    # ── Overview page content ───────────────────────────────────────────────────
     st.header("Overview")
 
-    if df_filtered.empty:
+    if df_filtered is None or df_filtered.empty:
         st.warning("No data available for selected filters.")
         st.stop()
 
@@ -207,6 +191,35 @@ def main() -> None:
         f'Last updated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>',
         unsafe_allow_html=True,
     )
+
+
+def main() -> None:
+    """Load data, populate session state for child pages, and run navigation."""
+    df = load_data()
+    if df is None:
+        st.error("Failed to load data. Please try again later.")
+        return
+
+    selected_category = setup_sidebar(df)
+
+    # Filter data
+    if selected_category == "All":
+        df_filtered = df
+    else:
+        df_filtered = df[df["offense_category"] == selected_category]
+
+    # Store in session state for child pages
+    st.session_state["df"] = df
+    st.session_state["df_filtered"] = df_filtered
+    st.session_state["selected_category"] = selected_category
+
+    pg = st.navigation([
+        st.Page(overview_page, title="Overview", default=True),
+        st.Page("pages/2_Trends.py", title="Trends"),
+        st.Page("pages/3_Geography.py", title="Geography"),
+        st.Page("pages/4_Analysis.py", title="Pivot Analysis"),
+    ])
+    pg.run()
 
 
 if __name__ == "__main__":
