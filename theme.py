@@ -89,7 +89,7 @@ def apply_dark_plotly(fig: go.Figure, accent_color: str = BLUE_ACCENT) -> go.Fig
         yaxis=dict(gridcolor="#1a1f2e", zerolinecolor="#1a1f2e"),
         coloraxis_colorbar=dict(
             tickfont=dict(color="#c0c8d4"),
-            titlefont=dict(color="#c0c8d4"),
+            title=dict(font=dict(color="#c0c8d4")),
         ),
         margin=dict(l=20, r=20, t=40, b=20),
     )
