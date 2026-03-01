@@ -5,7 +5,7 @@ import pandas as pd
 import plotly.express as px
 
 from constants import CHART_HEIGHT, TOP_N_ITEMS
-from utils import format_categorical_column, format_zip_code_column
+from utils import format_categorical_column
 from theme import inject_css, apply_dark_plotly, RED_ACCENT, AMBER_ACCENT
 
 inject_css()

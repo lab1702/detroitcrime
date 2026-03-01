@@ -13,7 +13,7 @@ from constants import (
     CHART_HEIGHT, MIN_FORECAST_DAYS, FORECAST_PERIODS, HISTORICAL_MONTHS,
     MIN_PROJECTION_DAYS, FORECAST_CACHE_TTL, YOY_CACHE_TTL,
 )
-from theme import inject_css, apply_dark_plotly, BLUE_ACCENT, TEAL_ACCENT
+from theme import inject_css, apply_dark_plotly, BLUE_ACCENT
 
 inject_css()
 
@@ -92,7 +92,7 @@ with left:
 with right:
     st.subheader("Hour of Day × Day of Week")
 
-    @st.cache_data(ttl=3600)
+    @st.cache_data(ttl=FORECAST_CACHE_TTL)
     def create_heatmap(df):
         heatmap_data = (
             df.groupby(["incident_day_of_week", "incident_hour_of_day"])

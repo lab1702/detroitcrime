@@ -16,7 +16,7 @@ import requests
 from constants import (
     DATA_URL, DATA_CACHE_TTL,
     MIN_DATE, DETROIT_LAT_MIN, DETROIT_LAT_MAX, DETROIT_LON_MIN, DETROIT_LON_MAX,
-    CHART_HEIGHT, TOP_N_ITEMS,
+    CHART_HEIGHT, TOP_N_ITEMS, MIN_PROJECTION_DAYS,
 )
 from utils import validate_data, safe_load_data_from_url, clean_and_filter_data
 from theme import inject_css, apply_dark_plotly, BLUE_ACCENT, GREEN_ACCENT, RED_ACCENT
@@ -79,7 +79,7 @@ def compute_yoy_deltas(df_filtered: pd.DataFrame):
 
     if len(cy_data) > 0 and len(py_data) > 0:
         days_elapsed = (datetime.now() - datetime(current_year, 1, 1)).days
-        if days_elapsed > 60:  # Need at least 2 months of data
+        if days_elapsed > MIN_PROJECTION_DAYS:  # Need at least 2 months of data
             cy_annualized = len(cy_data) * (365 / days_elapsed)
             py_total = len(py_data)
 
