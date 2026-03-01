@@ -130,41 +130,59 @@ def create_generic_top_chart(df: pd.DataFrame, column_name: str, chart_title: st
     return fig
 
 
-def safe_load_data_from_url(url: str, timeout: int = 30) -> pd.DataFrame:
+def safe_load_data_from_url(url: str, timeout: int = 120, max_retries: int = 3) -> pd.DataFrame:
     """
-    Safely load data from URL with proper error handling
-    
+    Safely load data from URL with retries and streaming download.
+
     Args:
         url: URL to fetch data from
-        timeout: Request timeout in seconds
-    
+        timeout: Request timeout in seconds (connect, read)
+        max_retries: Number of retry attempts on transient failures
+
     Returns:
-        DataFrame or None if failed
-    
+        DataFrame
+
     Raises:
         Various specific exceptions for different failure modes
     """
-    try:
-        # Make request with timeout
-        with st.spinner("Downloading Detroit crime data..."):
-            response = requests.get(url, timeout=timeout)
-            response.raise_for_status()
-        
-        # Parse CSV data
-        df = pd.read_csv(StringIO(response.text), low_memory=False)
-        
-        return df
-        
-    except requests.exceptions.Timeout:
-        raise requests.exceptions.Timeout("Request timed out. Please try again.")
-    except requests.exceptions.ConnectionError:
-        raise requests.exceptions.ConnectionError("Failed to connect to data source. Check your internet connection.")
-    except requests.exceptions.HTTPError as e:
-        raise requests.exceptions.HTTPError(f"HTTP error {e.response.status_code}: {e.response.reason}")
-    except pd.errors.ParserError as e:
-        raise pd.errors.ParserError(f"Failed to parse CSV data: {str(e)}")
-    except Exception as e:
-        raise Exception(f"Unexpected error loading data: {str(e)}")
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            with st.spinner(f"Downloading Detroit crime data (attempt {attempt}/{max_retries})..."):
+                response = requests.get(url, timeout=(10, timeout), stream=True)
+                response.raise_for_status()
+                # Read content in chunks to avoid IncompleteRead on large files
+                chunks = []
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        chunks.append(chunk)
+                content = b"".join(chunks)
+
+            df = pd.read_csv(StringIO(content.decode("utf-8")), low_memory=False)
+            return df
+
+        except requests.exceptions.Timeout:
+            raise requests.exceptions.Timeout("Request timed out. Please try again.")
+        except requests.exceptions.HTTPError as e:
+            raise requests.exceptions.HTTPError(f"HTTP error {e.response.status_code}: {e.response.reason}")
+        except requests.exceptions.ConnectionError as e:
+            last_error = e
+            if attempt < max_retries:
+                import time
+                time.sleep(2 * attempt)
+                continue
+            raise requests.exceptions.ConnectionError("Failed to connect to data source. Check your internet connection.")
+        except pd.errors.ParserError as e:
+            raise pd.errors.ParserError(f"Failed to parse CSV data: {str(e)}")
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                import time
+                time.sleep(2 * attempt)
+                continue
+            raise Exception(f"Unexpected error loading data: {str(e)}")
+
+    raise Exception(f"Failed after {max_retries} attempts: {str(last_error)}")
 
 
 def clean_and_filter_data(df: pd.DataFrame, min_date: str, 
