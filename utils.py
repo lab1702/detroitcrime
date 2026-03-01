@@ -130,14 +130,15 @@ def create_generic_top_chart(df: pd.DataFrame, column_name: str, chart_title: st
     return fig
 
 
-def safe_load_data_from_url(url: str, timeout: int = 120, max_retries: int = 3) -> pd.DataFrame:
+def safe_load_data_from_url(url: str, timeout: int = 300) -> pd.DataFrame:
     """
-    Safely load data from URL with retries and streaming download.
+    Safely load data from URL with automatic retries at the transport level.
+
+    Uses urllib3 Retry adapter for robust handling of large downloads (~77MB).
 
     Args:
         url: URL to fetch data from
-        timeout: Request timeout in seconds (connect, read)
-        max_retries: Number of retry attempts on transient failures
+        timeout: Read timeout in seconds
 
     Returns:
         DataFrame
@@ -145,44 +146,44 @@ def safe_load_data_from_url(url: str, timeout: int = 120, max_retries: int = 3) 
     Raises:
         Various specific exceptions for different failure modes
     """
-    last_error = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            with st.spinner(f"Downloading Detroit crime data (attempt {attempt}/{max_retries})..."):
-                response = requests.get(url, timeout=(10, timeout), stream=True)
-                response.raise_for_status()
-                # Read content in chunks to avoid IncompleteRead on large files
-                chunks = []
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        chunks.append(chunk)
-                content = b"".join(chunks)
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
 
-            df = pd.read_csv(StringIO(content.decode("utf-8")), low_memory=False)
-            return df
+    retry_strategy = Retry(
+        total=5,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
+    session.mount("http://", HTTPAdapter(max_retries=retry_strategy))
 
-        except requests.exceptions.Timeout:
-            raise requests.exceptions.Timeout("Request timed out. Please try again.")
-        except requests.exceptions.HTTPError as e:
-            raise requests.exceptions.HTTPError(f"HTTP error {e.response.status_code}: {e.response.reason}")
-        except requests.exceptions.ConnectionError as e:
-            last_error = e
-            if attempt < max_retries:
-                import time
-                time.sleep(2 * attempt)
-                continue
-            raise requests.exceptions.ConnectionError("Failed to connect to data source. Check your internet connection.")
-        except pd.errors.ParserError as e:
-            raise pd.errors.ParserError(f"Failed to parse CSV data: {str(e)}")
-        except Exception as e:
-            last_error = e
-            if attempt < max_retries:
-                import time
-                time.sleep(2 * attempt)
-                continue
-            raise Exception(f"Unexpected error loading data: {str(e)}")
+    try:
+        with st.spinner("Downloading Detroit crime data..."):
+            response = session.get(url, timeout=(15, timeout), stream=True)
+            response.raise_for_status()
+            chunks = []
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    chunks.append(chunk)
+            content = b"".join(chunks)
 
-    raise Exception(f"Failed after {max_retries} attempts: {str(last_error)}")
+        df = pd.read_csv(StringIO(content.decode("utf-8")), low_memory=False)
+        return df
+
+    except requests.exceptions.Timeout:
+        raise requests.exceptions.Timeout("Request timed out. Please try again.")
+    except requests.exceptions.ConnectionError:
+        raise requests.exceptions.ConnectionError("Failed to connect to data source. Check your internet connection.")
+    except requests.exceptions.HTTPError as e:
+        raise requests.exceptions.HTTPError(f"HTTP error {e.response.status_code}: {e.response.reason}")
+    except pd.errors.ParserError as e:
+        raise pd.errors.ParserError(f"Failed to parse CSV data: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Unexpected error loading data: {str(e)}")
+    finally:
+        session.close()
 
 
 def clean_and_filter_data(df: pd.DataFrame, min_date: str, 
