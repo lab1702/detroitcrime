@@ -151,6 +151,7 @@ def safe_load_data_from_url(url: str, timeout: int = 300, max_retries: int = 5) 
     import time
 
     last_error = None
+    status_placeholder = st.empty()
     for attempt in range(1, max_retries + 1):
         try:
             with st.spinner(f"Downloading Detroit crime data (attempt {attempt}/{max_retries})..."):
@@ -163,21 +164,26 @@ def safe_load_data_from_url(url: str, timeout: int = 300, max_retries: int = 5) 
                 content = b"".join(chunks)
 
             df = pd.read_csv(StringIO(content.decode("utf-8")), low_memory=False)
+            status_placeholder.empty()
             return df
 
         except requests.exceptions.Timeout:
+            status_placeholder.empty()
             raise
         except requests.exceptions.HTTPError:
+            status_placeholder.empty()
             raise
         except pd.errors.ParserError:
+            status_placeholder.empty()
             raise
         except Exception as e:
             last_error = e
             if attempt < max_retries:
                 wait = 2 ** attempt
-                st.warning(f"Download interrupted, retrying in {wait}s... ({e})")
+                status_placeholder.warning(f"Download interrupted, retrying in {wait}s... ({e})")
                 time.sleep(wait)
                 continue
+            status_placeholder.empty()
             raise
 
     raise last_error
