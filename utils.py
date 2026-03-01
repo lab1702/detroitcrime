@@ -130,15 +130,17 @@ def create_generic_top_chart(df: pd.DataFrame, column_name: str, chart_title: st
     return fig
 
 
-def safe_load_data_from_url(url: str, timeout: int = 300) -> pd.DataFrame:
+def safe_load_data_from_url(url: str, timeout: int = 300, max_retries: int = 5) -> pd.DataFrame:
     """
-    Safely load data from URL with automatic retries at the transport level.
+    Safely load data from URL with application-level retries.
 
-    Uses urllib3 Retry adapter for robust handling of large downloads (~77MB).
+    Retries the entire download on any transient failure including
+    IncompleteRead errors that occur mid-stream during large downloads.
 
     Args:
         url: URL to fetch data from
         timeout: Read timeout in seconds
+        max_retries: Number of full download attempts
 
     Returns:
         DataFrame
@@ -146,44 +148,39 @@ def safe_load_data_from_url(url: str, timeout: int = 300) -> pd.DataFrame:
     Raises:
         Various specific exceptions for different failure modes
     """
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
+    import time
 
-    retry_strategy = Retry(
-        total=5,
-        backoff_factor=2,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
-    session = requests.Session()
-    session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
-    session.mount("http://", HTTPAdapter(max_retries=retry_strategy))
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            with st.spinner(f"Downloading Detroit crime data (attempt {attempt}/{max_retries})..."):
+                response = requests.get(url, timeout=(15, timeout), stream=True)
+                response.raise_for_status()
+                chunks = []
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        chunks.append(chunk)
+                content = b"".join(chunks)
 
-    try:
-        with st.spinner("Downloading Detroit crime data..."):
-            response = session.get(url, timeout=(15, timeout), stream=True)
-            response.raise_for_status()
-            chunks = []
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    chunks.append(chunk)
-            content = b"".join(chunks)
+            df = pd.read_csv(StringIO(content.decode("utf-8")), low_memory=False)
+            return df
 
-        df = pd.read_csv(StringIO(content.decode("utf-8")), low_memory=False)
-        return df
+        except requests.exceptions.Timeout:
+            raise
+        except requests.exceptions.HTTPError:
+            raise
+        except pd.errors.ParserError:
+            raise
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                st.warning(f"Download interrupted, retrying in {wait}s... ({e})")
+                time.sleep(wait)
+                continue
+            raise
 
-    except requests.exceptions.Timeout:
-        raise requests.exceptions.Timeout("Request timed out. Please try again.")
-    except requests.exceptions.ConnectionError:
-        raise requests.exceptions.ConnectionError("Failed to connect to data source. Check your internet connection.")
-    except requests.exceptions.HTTPError as e:
-        raise requests.exceptions.HTTPError(f"HTTP error {e.response.status_code}: {e.response.reason}")
-    except pd.errors.ParserError as e:
-        raise pd.errors.ParserError(f"Failed to parse CSV data: {str(e)}")
-    except Exception as e:
-        raise Exception(f"Unexpected error loading data: {str(e)}")
-    finally:
-        session.close()
+    raise last_error
 
 
 def clean_and_filter_data(df: pd.DataFrame, min_date: str, 
