@@ -177,6 +177,14 @@ def overview_page() -> None:
 
 def main() -> None:
     """Load data, populate session state for child pages, and run navigation."""
+    pg = st.navigation([
+        st.Page(overview_page, title="Overview", default=True),
+        st.Page("pages/2_Trends.py", title="Trends"),
+        st.Page("pages/3_Geography.py", title="Geography"),
+        st.Page("pages/4_Analysis.py", title="Pivot Analysis"),
+        st.Page("pages/5_Map.py", title="Map"),
+    ])
+
     try:
         df = load_data()
     except requests.exceptions.Timeout:
@@ -208,13 +216,6 @@ def main() -> None:
     st.session_state["df_filtered"] = df_filtered
     st.session_state["selected_category"] = selected_category
 
-    pg = st.navigation([
-        st.Page(overview_page, title="Overview", default=True),
-        st.Page("pages/2_Trends.py", title="Trends"),
-        st.Page("pages/3_Geography.py", title="Geography"),
-        st.Page("pages/4_Analysis.py", title="Pivot Analysis"),
-        st.Page("pages/5_Map.py", title="Map"),
-    ])
     pg.run()
 
 
