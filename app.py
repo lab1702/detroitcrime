@@ -5,7 +5,6 @@ Handles data loading, caching, sidebar filters, session state,
 and displays the Overview page (KPIs, summary charts, daily sparkline).
 """
 
-from typing import Optional
 from datetime import datetime
 import streamlit as st
 import pandas as pd
@@ -32,30 +31,13 @@ inject_css()
 
 
 @st.cache_data(ttl=DATA_CACHE_TTL, show_spinner=False)
-def load_data() -> Optional[pd.DataFrame]:
-    """Load Detroit crime data with error handling and validation."""
-    try:
-        df = safe_load_data_from_url(DATA_URL)
-        validate_data(df)
-        lat_bounds = (DETROIT_LAT_MIN, DETROIT_LAT_MAX)
-        lon_bounds = (DETROIT_LON_MIN, DETROIT_LON_MAX)
-        df = clean_and_filter_data(df, MIN_DATE, lat_bounds, lon_bounds)
-        return df
-    except requests.exceptions.Timeout:
-        st.error("Request timed out. The data source may be slow. Please try again.")
-        return None
-    except requests.exceptions.ConnectionError:
-        st.error("Connection failed. Please check your internet connection and try again.")
-        return None
-    except requests.exceptions.HTTPError as e:
-        st.error(f"Server error: {str(e)}. The data source may be temporarily unavailable.")
-        return None
-    except ValueError as e:
-        st.error(f"Data validation error: {str(e)}")
-        return None
-    except Exception as e:
-        st.error(f"Unexpected error loading data: {str(e)}")
-        return None
+def load_data() -> pd.DataFrame:
+    """Load Detroit crime data. Raises on failure so errors are not cached."""
+    df = safe_load_data_from_url(DATA_URL)
+    validate_data(df)
+    lat_bounds = (DETROIT_LAT_MIN, DETROIT_LAT_MAX)
+    lon_bounds = (DETROIT_LON_MIN, DETROIT_LON_MAX)
+    return clean_and_filter_data(df, MIN_DATE, lat_bounds, lon_bounds)
 
 
 def setup_sidebar(df: pd.DataFrame) -> str:
@@ -195,9 +177,22 @@ def overview_page() -> None:
 
 def main() -> None:
     """Load data, populate session state for child pages, and run navigation."""
-    df = load_data()
-    if df is None:
-        st.error("Failed to load data. Please try again later.")
+    try:
+        df = load_data()
+    except requests.exceptions.Timeout:
+        st.error("Request timed out. The data source may be slow. Please try again.")
+        return
+    except requests.exceptions.ConnectionError:
+        st.error("Connection failed. Please check your internet connection and try again.")
+        return
+    except requests.exceptions.HTTPError as e:
+        st.error(f"Server error: {str(e)}. The data source may be temporarily unavailable.")
+        return
+    except ValueError as e:
+        st.error(f"Data validation error: {str(e)}")
+        return
+    except Exception as e:
+        st.error(f"Unexpected error loading data: {str(e)}")
         return
 
     selected_category = setup_sidebar(df)
