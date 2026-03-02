@@ -1,10 +1,11 @@
 """Map page — geographic incident visualization with scatter and heatmap modes."""
 
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import plotly.express as px
 
-from constants import CHART_HEIGHT, MAX_MAP_SAMPLE
+from constants import MAX_MAP_SAMPLE
 from theme import inject_css
 
 inject_css()
@@ -56,6 +57,32 @@ NEON_COLORS = [
 
 MAP_HEIGHT = 700
 
+# JavaScript to prevent page scroll when wheeling over the map.
+# The Plotly chart lives in an iframe; wheel events on the iframe element
+# in the parent document cause the Streamlit container to scroll.
+# We intercept those events so scroll-wheel zooms the map instead.
+_SCROLL_FIX_JS = """
+<script>
+(function() {
+    const doc = window.parent.document;
+    function fix() {
+        doc.querySelectorAll('[data-testid="stPlotlyChart"]').forEach(function(el) {
+            if (!el._mapScrollFixed) {
+                el._mapScrollFixed = true;
+                el.addEventListener('wheel', function(e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                }, {passive: false});
+            }
+        });
+    }
+    fix();
+    setTimeout(fix, 500);
+    setTimeout(fix, 1500);
+})();
+</script>
+"""
+
 if mode == "Scatter":
     # Sample to keep rendering fast
     if len(df_map) > MAX_MAP_SAMPLE:
@@ -95,6 +122,7 @@ if mode == "Scatter":
     )
     fig.update_traces(marker=dict(size=5))
     st.plotly_chart(fig, use_container_width=True)
+    components.html(_SCROLL_FIX_JS, height=0)
 
 else:
     # Heatmap can handle more points since it's aggregated
@@ -134,6 +162,7 @@ else:
         ),
     )
     st.plotly_chart(fig, use_container_width=True)
+    components.html(_SCROLL_FIX_JS, height=0)
 
 # ── Info line ────────────────────────────────────────────────────────────────
 sample_note = ""
