@@ -71,7 +71,6 @@ _SCROLL_FIX_JS = """
                 el._mapScrollFixed = true;
                 el.addEventListener('wheel', function(e) {
                     e.preventDefault();
-                    e.stopPropagation();
                 }, {passive: false});
             }
         });
@@ -121,7 +120,7 @@ if mode == "Scatter":
         ),
     )
     fig.update_traces(marker=dict(size=5))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
     components.html(_SCROLL_FIX_JS, height=0)
 
 else:
@@ -161,7 +160,7 @@ else:
             borderwidth=1,
         ),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
     components.html(_SCROLL_FIX_JS, height=0)
 
 # ── Info line ────────────────────────────────────────────────────────────────
