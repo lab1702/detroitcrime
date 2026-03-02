@@ -71,9 +71,15 @@ view_state = pdk.ViewState(
 )
 
 if mode == "Scatter":
+    # Only pass columns pydeck needs — avoids serialization errors from
+    # Timestamps and other complex types in the full DataFrame.
+    scatter_cols = ["latitude", "longitude", "offense_category",
+                    "nearest_intersection", "color_r", "color_g", "color_b"]
+    df_scatter = df_map[scatter_cols]
+
     layer = pdk.Layer(
         "ScatterplotLayer",
-        data=df_map,
+        data=df_scatter,
         get_position=["longitude", "latitude"],
         get_color="[color_r, color_g, color_b, 180]",
         get_radius=40,
@@ -94,9 +100,11 @@ if mode == "Scatter":
     }
 
 else:
+    df_heat = df_map[["latitude", "longitude"]]
+
     layer = pdk.Layer(
         "HeatmapLayer",
-        data=df_map,
+        data=df_heat,
         get_position=["longitude", "latitude"],
         get_weight=1,
         radiusPixels=30,
