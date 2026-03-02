@@ -1,11 +1,9 @@
 """Map page — geographic incident visualization with scatter and heatmap modes."""
 
 import streamlit as st
-import streamlit.components.v1 as components
 import pandas as pd
-import plotly.express as px
+import pydeck as pdk
 
-from constants import MAX_MAP_SAMPLE
 from theme import inject_css
 
 inject_css()
@@ -36,138 +34,112 @@ mode = st.radio("View", ["Scatter", "Heatmap"], horizontal=True)
 DETROIT_LAT = 42.3314
 DETROIT_LON = -83.0458
 
-# Neon color palette for offense categories
+# Neon color palette for offense categories (RGBA)
 NEON_COLORS = [
-    "#ff4b4b",  # red
-    "#00d4ff",  # cyan
-    "#ffaa00",  # amber
-    "#00c853",  # green
-    "#e040fb",  # magenta
-    "#ff6e40",  # deep orange
-    "#00bfa5",  # teal
-    "#ffea00",  # yellow
-    "#7c4dff",  # purple
-    "#18ffff",  # light cyan
-    "#ff80ab",  # pink
-    "#76ff03",  # lime
-    "#f50057",  # hot pink
-    "#651fff",  # deep purple
-    "#00e5ff",  # bright cyan
+    [255, 75, 75],    # red
+    [0, 212, 255],    # cyan
+    [255, 170, 0],    # amber
+    [0, 200, 83],     # green
+    [224, 64, 251],   # magenta
+    [255, 110, 64],   # deep orange
+    [0, 191, 165],    # teal
+    [255, 234, 0],    # yellow
+    [124, 77, 255],   # purple
+    [24, 255, 255],   # light cyan
+    [255, 128, 171],  # pink
+    [118, 255, 3],    # lime
+    [245, 0, 87],     # hot pink
+    [101, 31, 255],   # deep purple
+    [0, 229, 255],    # bright cyan
 ]
 
 MAP_HEIGHT = 700
 
-# JavaScript to prevent page scroll when wheeling over the map.
-# The Plotly chart lives in an iframe; wheel events on the iframe element
-# in the parent document cause the Streamlit container to scroll.
-# We intercept those events so scroll-wheel zooms the map instead.
-_SCROLL_FIX_JS = """
-<script>
-(function() {
-    const doc = window.parent.document;
-    function fix() {
-        doc.querySelectorAll('[data-testid="stPlotlyChart"]').forEach(function(el) {
-            if (!el._mapScrollFixed) {
-                el._mapScrollFixed = true;
-                el.addEventListener('wheel', function(e) {
-                    e.preventDefault();
-                }, {passive: false});
-            }
-        });
-    }
-    fix();
-    setTimeout(fix, 500);
-    setTimeout(fix, 1500);
-})();
-</script>
-"""
+# Assign colors to categories based on the full dataset (stable mapping)
+all_categories = sorted(df_map["offense_category"].unique())
+color_map = {cat: NEON_COLORS[i % len(NEON_COLORS)] for i, cat in enumerate(all_categories)}
+df_map = df_map.copy()
+df_map["color"] = df_map["offense_category"].map(color_map)
+
+view_state = pdk.ViewState(
+    latitude=DETROIT_LAT,
+    longitude=DETROIT_LON,
+    zoom=10,
+    pitch=0,
+)
 
 if mode == "Scatter":
-    # Sample to keep rendering fast
-    if len(df_map) > MAX_MAP_SAMPLE:
-        df_plot = df_map.sample(n=MAX_MAP_SAMPLE, random_state=42)
-    else:
-        df_plot = df_map
-
-    # Assign neon colors to categories
-    categories = sorted(df_plot["offense_category"].unique())
-    color_map = {cat: NEON_COLORS[i % len(NEON_COLORS)] for i, cat in enumerate(categories)}
-
-    fig = px.scatter_mapbox(
-        df_plot,
-        lat="latitude",
-        lon="longitude",
-        color="offense_category",
-        color_discrete_map=color_map,
-        hover_data={"nearest_intersection": True, "offense_category": True,
-                     "latitude": False, "longitude": False},
+    layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=df_map,
+        get_position=["longitude", "latitude"],
+        get_color="color",
+        get_radius=40,
+        radius_min_pixels=2,
+        radius_max_pixels=8,
         opacity=0.7,
-        zoom=10,
-        center={"lat": DETROIT_LAT, "lon": DETROIT_LON},
+        pickable=True,
     )
-    fig.update_layout(
-        mapbox_style="carto-darkmatter",
-        height=MAP_HEIGHT,
-        paper_bgcolor="#0E1117",
-        font=dict(color="#c0c8d4"),
-        margin=dict(l=0, r=0, t=0, b=0),
-        legend=dict(
-            title="Offense Category",
-            bgcolor="rgba(10, 14, 20, 0.85)",
-            bordercolor="#2d3548",
-            borderwidth=1,
-            font=dict(color="#c0c8d4", size=11),
-        ),
-    )
-    fig.update_traces(marker=dict(size=5))
-    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
-    components.html(_SCROLL_FIX_JS, height=0)
+    tooltip = {
+        "html": "<b>{offense_category}</b><br/>{nearest_intersection}",
+        "style": {
+            "backgroundColor": "#0a0e14",
+            "color": "#e0e0e0",
+            "border": "1px solid #2d3548",
+            "borderRadius": "4px",
+            "padding": "8px",
+        },
+    }
 
 else:
-    # Heatmap can handle more points since it's aggregated
-    max_heatmap = MAX_MAP_SAMPLE * 5
-    if len(df_map) > max_heatmap:
-        df_plot = df_map.sample(n=max_heatmap, random_state=42)
-    else:
-        df_plot = df_map
-
-    fig = px.density_mapbox(
-        df_plot,
-        lat="latitude",
-        lon="longitude",
-        radius=8,
-        zoom=10,
-        center={"lat": DETROIT_LAT, "lon": DETROIT_LON},
-        color_continuous_scale=[
-            [0.0, "#0d0030"],
-            [0.25, "#6a0dad"],
-            [0.5, "#e040fb"],
-            [0.75, "#ff6e40"],
-            [1.0, "#ffea00"],
+    layer = pdk.Layer(
+        "HeatmapLayer",
+        data=df_map,
+        get_position=["longitude", "latitude"],
+        get_weight=1,
+        radiusPixels=30,
+        intensity=1,
+        threshold=0.1,
+        color_range=[
+            [13, 0, 48],      # deep dark purple
+            [106, 13, 173],   # purple
+            [224, 64, 251],   # magenta
+            [255, 110, 64],   # deep orange
+            [255, 234, 0],    # yellow
         ],
+        opacity=0.8,
     )
-    fig.update_layout(
-        mapbox_style="carto-darkmatter",
-        height=MAP_HEIGHT,
-        paper_bgcolor="#0E1117",
-        font=dict(color="#c0c8d4"),
-        margin=dict(l=0, r=0, t=0, b=0),
-        coloraxis_colorbar=dict(
-            title=dict(text="Density", font=dict(color="#c0c8d4")),
-            tickfont=dict(color="#c0c8d4"),
-            bgcolor="rgba(10, 14, 20, 0.85)",
-            bordercolor="#2d3548",
-            borderwidth=1,
-        ),
+    tooltip = None
+
+deck = pdk.Deck(
+    layers=[layer],
+    initial_view_state=view_state,
+    map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+    height=MAP_HEIGHT,
+)
+
+st.pydeck_chart(deck, use_container_width=True, height=MAP_HEIGHT)
+
+# ── Legend for scatter mode ──────────────────────────────────────────────────
+if mode == "Scatter":
+    # Build a compact CSS legend
+    visible_cats = sorted(df_map["offense_category"].unique())
+    legend_items = []
+    for cat in visible_cats:
+        r, g, b = color_map[cat]
+        legend_items.append(
+            f'<span style="display:inline-block;width:10px;height:10px;'
+            f'background:rgb({r},{g},{b});border-radius:50%;margin-right:5px;"></span>'
+            f'<span style="margin-right:14px;">{cat}</span>'
+        )
+    legend_html = (
+        '<div style="background:#0a0e14;border:1px solid #2d3548;border-radius:6px;'
+        'padding:10px 14px;color:#c0c8d4;font-size:0.8rem;line-height:1.8;'
+        'max-height:150px;overflow-y:auto;">'
+        + "".join(legend_items)
+        + "</div>"
     )
-    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
-    components.html(_SCROLL_FIX_JS, height=0)
+    st.markdown(legend_html, unsafe_allow_html=True)
 
 # ── Info line ────────────────────────────────────────────────────────────────
-sample_note = ""
-if mode == "Scatter" and len(df_map) > MAX_MAP_SAMPLE:
-    sample_note = f" (showing {MAX_MAP_SAMPLE:,} of {len(df_map):,})"
-elif mode == "Heatmap" and len(df_map) > MAX_MAP_SAMPLE * 5:
-    sample_note = f" (showing {MAX_MAP_SAMPLE * 5:,} of {len(df_map):,})"
-
-st.caption(f"{len(df_map):,} geocoded incidents{sample_note}")
+st.caption(f"{len(df_map):,} geocoded incidents")
