@@ -59,7 +59,9 @@ MAP_HEIGHT = 700
 all_categories = sorted(df_map["offense_category"].unique())
 color_map = {cat: NEON_COLORS[i % len(NEON_COLORS)] for i, cat in enumerate(all_categories)}
 df_map = df_map.copy()
-df_map["color"] = df_map["offense_category"].map(color_map)
+df_map["color_r"] = df_map["offense_category"].map(lambda c: color_map[c][0])
+df_map["color_g"] = df_map["offense_category"].map(lambda c: color_map[c][1])
+df_map["color_b"] = df_map["offense_category"].map(lambda c: color_map[c][2])
 
 view_state = pdk.ViewState(
     latitude=DETROIT_LAT,
@@ -73,7 +75,7 @@ if mode == "Scatter":
         "ScatterplotLayer",
         data=df_map,
         get_position=["longitude", "latitude"],
-        get_color="color",
+        get_color="[color_r, color_g, color_b, 180]",
         get_radius=40,
         radius_min_pixels=2,
         radius_max_pixels=8,
