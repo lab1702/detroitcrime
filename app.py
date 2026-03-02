@@ -40,12 +40,14 @@ def load_data() -> pd.DataFrame:
     return clean_and_filter_data(df, MIN_DATE, lat_bounds, lon_bounds)
 
 
-def setup_sidebar(df: pd.DataFrame) -> str:
-    """Set up sidebar filters and return the selected category."""
+def setup_sidebar(df: pd.DataFrame) -> tuple[str, str]:
+    """Set up sidebar filters and return the selected category and year."""
     st.sidebar.header("Filters")
     offense_categories = ["All"] + sorted(df["offense_category"].unique().tolist())
     selected_category = st.sidebar.selectbox("Offense Category", offense_categories)
-    return selected_category
+    years = ["All"] + sorted(df["incident_year"].dropna().unique().astype(int).tolist())
+    selected_year = st.sidebar.selectbox("Year", years)
+    return selected_category, selected_year
 
 
 def compute_yoy_deltas(df_filtered: pd.DataFrame):
@@ -203,13 +205,14 @@ def main() -> None:
         st.error(f"Unexpected error loading data: {str(e)}")
         return
 
-    selected_category = setup_sidebar(df)
+    selected_category, selected_year = setup_sidebar(df)
 
     # Filter data
-    if selected_category == "All":
-        df_filtered = df
-    else:
-        df_filtered = df[df["offense_category"] == selected_category]
+    df_filtered = df
+    if selected_category != "All":
+        df_filtered = df_filtered[df_filtered["offense_category"] == selected_category]
+    if selected_year != "All":
+        df_filtered = df_filtered[df_filtered["incident_year"] == int(selected_year)]
 
     # Store in session state for child pages
     st.session_state["df"] = df
