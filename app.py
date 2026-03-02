@@ -218,6 +218,7 @@ def main() -> None:
         st.Page("pages/2_Trends.py", title="Trends"),
         st.Page("pages/3_Geography.py", title="Geography"),
         st.Page("pages/4_Analysis.py", title="Pivot Analysis"),
+        st.Page("pages/5_Map.py", title="Map"),
     ])
     pg.run()
 
