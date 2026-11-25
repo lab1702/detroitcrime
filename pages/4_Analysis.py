@@ -23,45 +23,37 @@ if df_filtered.empty:
     st.stop()
 
 # ── Pivot controls ───────────────────────────────────────────────────────────
+# Streamlit drops a widget's state while its page is not shown, so the current
+# selection is also kept under plain session-state keys and used to seed the
+# widgets when the user comes back to this page.
+if "pivot_rows" not in st.session_state:
+    st.session_state["pivot_rows"] = st.session_state.get("pivot_rows_selection", PIVOT_COLUMNS[0])
+if "pivot_columns" not in st.session_state:
+    st.session_state["pivot_columns"] = st.session_state.get("pivot_columns_selection", PIVOT_COLUMNS[1])
+
+
+def swap_pivot_axes() -> None:
+    """Swap the row and column selections (runs before the page is redrawn)."""
+    st.session_state["pivot_rows"], st.session_state["pivot_columns"] = (
+        st.session_state["pivot_columns"],
+        st.session_state["pivot_rows"],
+    )
+
+
 col1, col2, col3 = st.columns([2, 2, 1])
 
-if "pivot_rows_selection" not in st.session_state:
-    st.session_state.pivot_rows_selection = PIVOT_COLUMNS[0]
-if "pivot_columns_selection" not in st.session_state:
-    st.session_state.pivot_columns_selection = PIVOT_COLUMNS[1]
-
 with col1:
-    rows = st.selectbox(
-        "Rows (Group by):",
-        PIVOT_COLUMNS,
-        index=(
-            PIVOT_COLUMNS.index(st.session_state.pivot_rows_selection)
-            if st.session_state.pivot_rows_selection in PIVOT_COLUMNS
-            else 0
-        ),
-        key="pivot_rows",
-    )
-    st.session_state.pivot_rows_selection = rows
+    rows = st.selectbox("Rows (Group by):", PIVOT_COLUMNS, key="pivot_rows")
 
 with col2:
-    columns = st.selectbox(
-        "Columns:",
-        PIVOT_COLUMNS,
-        index=(
-            PIVOT_COLUMNS.index(st.session_state.pivot_columns_selection)
-            if st.session_state.pivot_columns_selection in PIVOT_COLUMNS
-            else 1
-        ),
-        key="pivot_columns",
-    )
-    st.session_state.pivot_columns_selection = columns
+    columns = st.selectbox("Columns:", PIVOT_COLUMNS, key="pivot_columns")
 
 with col3:
     st.write("")
-    if st.button("Swap", help="Swap rows and columns", key="swap_pivot"):
-        temp = st.session_state.pivot_rows_selection
-        st.session_state.pivot_rows_selection = st.session_state.pivot_columns_selection
-        st.session_state.pivot_columns_selection = temp
+    st.button("Swap", help="Swap rows and columns", key="swap_pivot", on_click=swap_pivot_axes)
+
+st.session_state["pivot_rows_selection"] = rows
+st.session_state["pivot_columns_selection"] = columns
 
 # ── Create pivot table ───────────────────────────────────────────────────────
 try:
@@ -104,11 +96,11 @@ try:
         fig.update_xaxes(type="category")
     fig.update_layout(height=CHART_HEIGHT)
     apply_dark_plotly(fig, TEAL_ACCENT)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     st.subheader("Pivot Table Data")
     st.info(f"Table size: {pivot_table.shape[0]} rows × {pivot_table.shape[1]} columns")
-    st.dataframe(pivot_table, use_container_width=True)
+    st.dataframe(pivot_table, width="stretch")
 
 except Exception as e:
     st.error(f"Error creating pivot table: {str(e)}")

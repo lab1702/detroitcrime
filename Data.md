@@ -18,11 +18,11 @@
 | state_offense_code | String | State-specific offense code |
 | arrest_charge | String | Arrest charge code |
 | charge_description | String | Description of the charge |
-| incident_occurred_at | DateTime | Date and time when incident occurred |
-| incident_time | Time | Time of incident (HH:MM:SS format) |
-| incident_day_of_week | Integer | Day of week (1-7, where 1=Sunday) |
-| incident_hour_of_day | Integer | Hour of day (0-23) |
-| incident_year | Integer | Year when incident occurred |
+| incident_occurred_at | DateTime | Date and time when incident occurred, published in UTC (e.g. `2019/11/30 03:33:00+00`) |
+| incident_time | Time | Local (Detroit) time of incident (HH:MM:SS format) |
+| incident_day_of_week | Integer | Local day of week, ISO-numbered (1=Monday ... 7=Sunday) |
+| incident_hour_of_day | Integer | Local hour of day (0-23) |
+| incident_year | Integer | Local year when incident occurred (the app derives its own from the converted timestamp) |
 | case_id | String | Case identifier |
 | case_status | String | Status of the case (ACTIVE, INACTIVE, CLEARED BY ARREST) |
 | case_status_updated_at | DateTime | When case status was last updated |
@@ -63,7 +63,9 @@ The application requires the following columns for proper functionality:
 
 The application implements several data quality measures:
 - **Geographic Filtering**: Latitude (42.0-43.0), Longitude (-84.0 to -82.0)
-- **Temporal Filtering**: Data from 2018-01-01 onwards
+- **Local Time**: `incident_occurred_at` is converted from UTC to Detroit time (`America/Detroit`); `date` and `incident_year` are derived from the local time
+- **Temporal Filtering**: Data from 2018-01-01 (local time) onwards
+- **Text Cleanup**: Trailing padding is trimmed from category, description, status, neighborhood and intersection values
 - **Quality Control**: Removes records with missing coordinates or invalid values
 - **Real-time Exclusion**: Excludes most recent date to avoid incomplete data
 - **Categorical Formatting**: Special handling for zip codes, precincts, and districts
@@ -73,5 +75,7 @@ The application implements several data quality measures:
 - Some records may have missing coordinates (empty X, Y values)
 - Incidents span multiple years (2017-2025 based on sample)
 - Real-time data with recent incidents marked as "ACTIVE"
+- Each row is one offense: a report with several charges appears once per charge, so counts are offenses, not distinct reports
+- The portal export typically lags the present by several days; year-to-date figures are measured up to the last day in the data
 - Application validates data structure on load
 - Comprehensive error handling for data quality issues

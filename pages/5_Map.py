@@ -1,9 +1,14 @@
 """Map page — geographic incident visualization with scatter and heatmap modes."""
 
+import html
+import json
+
 import streamlit as st
 import pandas as pd
 import pydeck as pdk
+from pydeck.bindings.json_tools import default_serialize
 
+from constants import MAX_SCATTER_POINTS
 from theme import inject_css
 
 inject_css()
@@ -20,8 +25,10 @@ if df_filtered.empty:
     st.warning("No data available for selected filters.")
     st.stop()
 
-# Drop rows missing coordinates
-df_map = df_filtered.dropna(subset=["latitude", "longitude"])
+# Keep only what the map needs, and drop rows missing coordinates
+df_map = df_filtered[
+    ["latitude", "longitude", "offense_category", "nearest_intersection"]
+].dropna(subset=["latitude", "longitude"])
 
 if df_map.empty:
     st.warning("No geocoded incidents available.")
@@ -34,7 +41,7 @@ mode = st.radio("View", ["Scatter", "Heatmap"], horizontal=True)
 DETROIT_LAT = 42.3314
 DETROIT_LON = -83.0458
 
-# Neon color palette for offense categories (RGBA)
+# Neon color palette for offense categories (RGB)
 NEON_COLORS = [
     [255, 75, 75],    # red
     [0, 212, 255],    # cyan
@@ -52,16 +59,30 @@ NEON_COLORS = [
     [101, 31, 255],   # deep purple
     [0, 229, 255],    # bright cyan
 ]
+# Shared by every category beyond the palette, shown as "Other" in the legend
+OTHER_COLOR = [140, 150, 165]  # grey
 
 MAP_HEIGHT = 700
 
-# Assign colors to categories based on the full dataset (stable mapping)
-all_categories = sorted(df_map["offense_category"].unique())
-color_map = {cat: NEON_COLORS[i % len(NEON_COLORS)] for i, cat in enumerate(all_categories)}
-df_map = df_map.copy()
-df_map["color_r"] = df_map["offense_category"].map(lambda c: color_map[c][0])
-df_map["color_g"] = df_map["offense_category"].map(lambda c: color_map[c][1])
-df_map["color_b"] = df_map["offense_category"].map(lambda c: color_map[c][2])
+
+class CompactDeck(pdk.Deck):
+    """A Deck that serializes without pretty-printing.
+
+    pydeck indents its JSON, and with one object per point the whitespace alone
+    is about half of what gets sent to the browser.
+    """
+
+    def to_json(self) -> str:
+        return json.dumps(self, sort_keys=True, default=default_serialize, separators=(",", ":"))
+
+# Assign colors from the full dataset's category ranking (most frequent first),
+# so a category keeps its color whatever the filters are and no two categories
+# named in the legend share one.
+category_order = (
+    st.session_state.get("category_order")
+    or df_map["offense_category"].value_counts().index.tolist()
+)
+color_map = dict(zip(category_order, NEON_COLORS))
 
 view_state = pdk.ViewState(
     latitude=DETROIT_LAT,
@@ -70,26 +91,44 @@ view_state = pdk.ViewState(
     pitch=0,
 )
 
+total_points = len(df_map)
+is_sampled = mode == "Scatter" and total_points > MAX_SCATTER_POINTS
+
 if mode == "Scatter":
-    # Only pass columns pydeck needs — avoids serialization errors from
-    # Timestamps and other complex types in the full DataFrame.
-    scatter_cols = ["latitude", "longitude", "offense_category",
-                    "nearest_intersection", "color_r", "color_g", "color_b"]
-    df_scatter = df_map[scatter_cols]
+    # Every point is sent to the browser as JSON, so very wide selections are
+    # sampled and the payload is kept small (short keys, rounded coordinates).
+    df_points = df_map.sample(n=MAX_SCATTER_POINTS, random_state=0) if is_sampled else df_map
+    category = df_points["offense_category"]
+
+    def color_channel(index: int) -> pd.Series:
+        channel = {name: rgb[index] for name, rgb in color_map.items()}
+        return category.map(channel).fillna(OTHER_COLOR[index]).astype(int)
+
+    # Plain columns only; missing text would serialize as NaN, which is not valid JSON
+    df_scatter = pd.DataFrame({
+        "lat": df_points["latitude"].round(5),
+        "lon": df_points["longitude"].round(5),
+        "category": category.fillna("Unknown"),
+        "location": df_points["nearest_intersection"].fillna("Unknown location"),
+        "r": color_channel(0),
+        "g": color_channel(1),
+        "b": color_channel(2),
+    })
 
     layer = pdk.Layer(
         "ScatterplotLayer",
         data=df_scatter,
-        get_position=["longitude", "latitude"],
-        get_color="[color_r, color_g, color_b, 180]",
+        get_position=["lon", "lat"],
+        get_color="[r, g, b, 180]",
         get_radius=40,
         radius_min_pixels=2,
         radius_max_pixels=8,
         opacity=0.7,
         pickable=True,
     )
+    # A text tooltip (not HTML), so values from the feed are never parsed as markup
     tooltip = {
-        "html": "<b>{offense_category}</b><br/>{nearest_intersection}",
+        "text": "{category}\n{location}",
         "style": {
             "backgroundColor": "#0a0e14",
             "color": "#e0e0e0",
@@ -100,13 +139,22 @@ if mode == "Scatter":
     }
 
 else:
-    df_heat = df_map[["latitude", "longitude"]]
+    # Incidents at the same spot are sent once with a weight, which gives the
+    # same density as one row per incident with a far smaller payload.
+    df_heat = (
+        pd.DataFrame({
+            "lat": df_map["latitude"].round(4),
+            "lon": df_map["longitude"].round(4),
+        })
+        .value_counts()
+        .reset_index(name="weight")
+    )
 
     layer = pdk.Layer(
         "HeatmapLayer",
         data=df_heat,
-        get_position=["longitude", "latitude"],
-        get_weight=1,
+        get_position=["lon", "lat"],
+        get_weight="weight",
         radiusPixels=30,
         intensity=1,
         threshold=0.1,
@@ -121,26 +169,32 @@ else:
     )
     tooltip = None
 
-deck = pdk.Deck(
+deck = CompactDeck(
     layers=[layer],
     initial_view_state=view_state,
     map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
     height=MAP_HEIGHT,
+    tooltip=tooltip,
 )
 
-st.pydeck_chart(deck, use_container_width=True, height=MAP_HEIGHT)
+st.pydeck_chart(deck, width="stretch", height=MAP_HEIGHT)
 
 # ── Legend for scatter mode ──────────────────────────────────────────────────
 if mode == "Scatter":
     # Build a compact CSS legend
-    visible_cats = sorted(df_map["offense_category"].unique())
+    visible_cats = sorted(df_map["offense_category"].dropna().unique())
+    legend_entries = [(cat, color_map[cat]) for cat in visible_cats if cat in color_map]
+    other_count = sum(1 for cat in visible_cats if cat not in color_map)
+    if other_count:
+        noun = "category" if other_count == 1 else "categories"
+        legend_entries.append((f"Other ({other_count} {noun})", OTHER_COLOR))
+
     legend_items = []
-    for cat in visible_cats:
-        r, g, b = color_map[cat]
+    for label, (r, g, b) in legend_entries:
         legend_items.append(
             f'<span style="display:inline-block;width:10px;height:10px;'
             f'background:rgb({r},{g},{b});border-radius:50%;margin-right:5px;"></span>'
-            f'<span style="margin-right:14px;">{cat}</span>'
+            f'<span style="margin-right:14px;">{html.escape(label)}</span>'
         )
     legend_html = (
         '<div style="background:#0a0e14;border:1px solid #2d3548;border-radius:6px;'
@@ -152,4 +206,11 @@ if mode == "Scatter":
     st.markdown(legend_html, unsafe_allow_html=True)
 
 # ── Info line ────────────────────────────────────────────────────────────────
-st.caption(f"{len(df_map):,} geocoded incidents")
+if is_sampled:
+    st.caption(
+        f"Showing a random sample of {MAX_SCATTER_POINTS:,} of {total_points:,} geocoded "
+        "incidents. Narrow the filters to plot every point, or switch to Heatmap, which "
+        "always uses all of them."
+    )
+else:
+    st.caption(f"{total_points:,} geocoded incidents")

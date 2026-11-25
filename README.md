@@ -18,7 +18,8 @@ An interactive web application for visualizing and analyzing Detroit crime incid
 - **Forecasting**: 1-year crime incident forecast using Facebook Prophet with holiday support
 - **Pivot Analysis**: Interactive pivot table analysis with customizable rows/columns
 - **Real-time Data**: Automatically fetches latest data from Detroit Open Data Portal
-- **Filtering**: Filter all analyses by offense category
+- **Map**: Scatter and density views of incident locations
+- **Filtering**: Filter all analyses by offense category and year
 - **Performance Optimized**: Multi-level caching system for optimal performance
 
 ## Tech Stack
@@ -39,6 +40,7 @@ The application fetches real-time crime incident data from the Detroit Open Data
 - **Update Frequency**: Real-time (cached for 24 hours in application)
 - **Coverage**: Crime incidents from 2018 onwards
 - **Coordinates**: Filtered for valid Detroit area coordinates
+- **Time zone**: Feed timestamps are UTC and are converted to Detroit local time on load
 
 ## Installation & Setup
 
@@ -85,15 +87,23 @@ The application will be available at `http://localhost:8502`
 
 ```
 detroitcrime/
-├── app.py                 # Main Streamlit application (12 tabs)
+├── app.py                 # Entry point: data loading, sidebar filters, Overview page
+├── pages/
+│   ├── 2_Trends.py        # Daily trend, year over year, hour x day heatmap, forecast
+│   ├── 3_Geography.py     # Neighborhoods, precincts, districts, zip codes, locations
+│   ├── 4_Analysis.py      # Interactive pivot table
+│   └── 5_Map.py           # Scatter and heatmap map
 ├── constants.py           # Configuration constants and parameters
-├── utils.py              # Utility functions for data processing
+├── utils.py               # Data loading, cleaning and year-over-year helpers
+├── theme.py               # Dark theme CSS and Plotly styling
+├── tests/                 # pytest suite (unit tests and headless page tests)
 ├── requirements.txt       # Python dependencies
-├── Dockerfile            # Docker configuration
-├── docker-compose.yml    # Docker Compose configuration
-├── Data.md              # Data source documentation
-├── plan.md              # Development plan
-└── README.md            # This file
+├── requirements-dev.txt   # Adds test dependencies
+├── Dockerfile             # Docker configuration
+├── docker-compose.yml     # Docker Compose configuration
+├── Data.md                # Data source documentation
+├── docs/plans/            # Design notes
+└── README.md              # This file
 ```
 
 ## Key Components
@@ -104,22 +114,15 @@ detroitcrime/
 - Cleans and filters data for quality
 - Removes invalid coordinates and recent incomplete data
 
-### Application Tabs
+### Application Pages
 
-The dashboard features 12 interactive tabs:
+The dashboard has five pages, all driven by the sidebar filters:
 
-1. **Categories**: Crime category analysis with drill-down to offense descriptions
-2. **Case Status**: Distribution of case statuses across incidents
-3. **Year over Year**: Annual trends with current year projections
-4. **Daily Incidents**: Time series of daily incident counts
-5. **Hour of Day of Week**: Temporal pattern heatmap
-6. **Zip Codes**: Geographic analysis by zip code
-7. **Police Precincts**: Analysis by police precinct
-8. **Council Districts**: Analysis by council district
-9. **Neighborhoods**: Neighborhood-level analysis
-10. **Locations**: Analysis by nearest intersection
-11. **Forecast**: 1-year Prophet forecast with holiday annotations
-12. **Pivot Analysis**: Interactive pivot table with customizable dimensions
+1. **Overview**: KPI cards with year-over-year change, top categories (or offense descriptions when a category is selected), case status, daily incidents
+2. **Trends**: Daily incidents, year over year with a projection for the latest year, hour of day x day of week heatmap, 1-year Prophet forecast with holiday annotations
+3. **Geography**: Top neighborhoods, police precincts, council districts, zip codes and intersections
+4. **Pivot Analysis**: Interactive pivot table with customizable rows and columns
+5. **Map**: Incident locations as colour-coded points (sampled above 250,000 points) or as a density heatmap
 
 ### Advanced Features
 
@@ -132,7 +135,7 @@ The dashboard features 12 interactive tabs:
 - **Modular Architecture**: Separated constants, utilities, and main application
 
 ### Data Filtering
-- Offense category filter in sidebar
+- Offense category and year filters in sidebar
 - Real-time metric updates based on filters
 - Responsive UI with appropriate warnings for empty data
 
@@ -157,12 +160,15 @@ The application uses the following environment variables (set in docker-compose.
 The application implements several data quality measures:
 - Removes records with missing coordinates
 - Filters out invalid coordinates (latitude: 42.0-43.0, longitude: -84.0 to -82.0)
+- Converts feed timestamps from UTC to Detroit local time before deriving dates and years
 - Excludes the most recent date to avoid incomplete data
 - Filters data from 2018-01-01 onwards for consistency
+- Trims padded text values so the same value is not counted twice
 
 ## Development Notes
 
-- Uses latest Python packages (no version pinning)
+- Dependencies are pinned to tested version ranges in `requirements.txt`; the Docker image uses `python:3.15`
+- Run the tests with `pip install -r requirements-dev.txt` then `pytest`
 - Follows Streamlit best practices for layout and caching
 - Implements error handling for API failures
 - Responsive design with wide layout configuration
@@ -174,7 +180,7 @@ The application implements several data quality measures:
 - **app.py**: Main Streamlit application with comprehensive type hints
 - **constants.py**: Centralized configuration and magic numbers
 - **utils.py**: Reusable utility functions for data processing
-- **requirements.txt**: Pinned dependencies for security and stability
+- **requirements.txt**: Dependencies pinned to tested version ranges
 
 ### Best Practices Implemented
 - **Type Safety**: Full type hint coverage

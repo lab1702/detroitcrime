@@ -1,6 +1,8 @@
 """Theme and styling for Detroit Crime Dashboard"""
 
+import plotly.express as px
 import plotly.graph_objects as go
+import plotly.io as pio
 import streamlit as st
 
 # Accent color palettes
@@ -70,8 +72,24 @@ def inject_css():
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
+def _has_default_color(color) -> bool:
+    """Whether a trace color was left at the default rather than chosen.
+
+    Plotly Express never leaves the color unset: it fills in the first entry
+    of the active template's colorway (Streamlit installs placeholders such as
+    "#000001"). So "default" means None or one of those colorway entries.
+    """
+    if color is None:
+        return True
+    colorway = pio.templates[pio.templates.default].layout.colorway
+    return isinstance(color, str) and color in (colorway or px.colors.qualitative.Plotly)
+
+
 def apply_dark_plotly(fig: go.Figure, accent_color: str = BLUE_ACCENT) -> go.Figure:
     """Apply dark theme to a Plotly figure with an accent color.
+
+    Bar and line traces that still have their default color are drawn in the
+    accent color; traces given an explicit color keep it.
 
     Args:
         fig: Plotly figure to style.
@@ -93,9 +111,12 @@ def apply_dark_plotly(fig: go.Figure, accent_color: str = BLUE_ACCENT) -> go.Fig
         ),
         margin=dict(l=20, r=20, t=40, b=20),
     )
-    # Apply accent color to bar traces
+    # Apply accent color to bar and line traces that have no color of their own
     for trace in fig.data:
-        if hasattr(trace, "marker") and trace.type == "bar":
-            if trace.marker.color is None:
+        if trace.type == "bar":
+            if _has_default_color(trace.marker.color):
                 trace.marker.color = accent_color
+        elif trace.type in ("scatter", "scattergl") and "lines" in (trace.mode or ""):
+            if _has_default_color(trace.line.color):
+                trace.line.color = accent_color
     return fig

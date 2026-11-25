@@ -7,6 +7,9 @@ used throughout the Detroit crime incidents dashboard application.
 # Data source
 DATA_URL = "https://data.detroitmi.gov/api/download/v1/items/8e532daeec1149879bd5e67fdd9c8be0/csv?layers=0"
 
+# The feed publishes timestamps in UTC; all dates in the app are Detroit local time.
+LOCAL_TIMEZONE = "America/Detroit"
+
 # Data filtering
 MIN_DATE = '2018-01-01'
 DETROIT_LAT_MIN = 42.0
@@ -23,20 +26,23 @@ HISTORICAL_MONTHS = 3  # 3 months of history in forecast chart
 # Display parameters
 CHART_HEIGHT = 400
 TOP_N_ITEMS = 10
-MAX_MAP_SAMPLE = 1000
+# Scatter mode plots at most this many points; wider selections are sampled.
+MAX_SCATTER_POINTS = 250_000
 
 # Cache settings (in seconds)
 DATA_CACHE_TTL = 86400  # 24 hours
 FORECAST_CACHE_TTL = 3600  # 1 hour
 YOY_CACHE_TTL = 1800  # 30 minutes
 
-# Required columns for data validation
+# Columns the app reads from the feed. Only these are loaded, and all of them
+# must be present for the data to pass validation.
 REQUIRED_COLUMNS = [
-    'latitude', 
-    'longitude', 
+    'latitude',
+    'longitude',
     'incident_occurred_at',
     'incident_entry_id',
     'offense_category',
+    'offense_description',
     'case_status',
     'police_precinct',
     'council_district',
@@ -47,22 +53,32 @@ REQUIRED_COLUMNS = [
     'incident_hour_of_day'
 ]
 
+# Free-text columns that are whitespace-trimmed on load (the feed pads some
+# values with trailing spaces, which would otherwise count as separate values).
+TEXT_COLUMNS = [
+    'offense_category',
+    'offense_description',
+    'case_status',
+    'neighborhood',
+    'nearest_intersection',
+]
+
 # Categorical variables that need special formatting
 CATEGORICAL_VARS = ['zip_code', 'police_precinct', 'council_district']
 
-# Day of week labels (1=Sunday)
-DAY_LABELS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+# Day of week labels. The feed numbers days ISO-style: 1=Monday ... 7=Sunday.
+DAY_LABELS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
 
 # Available columns for pivot analysis
 PIVOT_COLUMNS = [
-    'offense_category', 
-    'case_status', 
-    'police_precinct', 
+    'offense_category',
+    'case_status',
+    'police_precinct',
     'council_district',
-    'neighborhood', 
-    'zip_code', 
-    'incident_year', 
-    'incident_day_of_week', 
+    'neighborhood',
+    'zip_code',
+    'incident_year',
+    'incident_day_of_week',
     'incident_hour_of_day'
 ]
 
