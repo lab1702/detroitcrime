@@ -49,10 +49,25 @@ MIN_LAST_DAY_SHARE = 0.1
 
 # A refresh is refused, and the copy in use kept, if it has fewer than this
 # share of that copy's incidents: the feed grows from day to day, so one that
-# has shrunk this much is a short export or has lost its coordinates.
-MIN_REFRESH_ROW_SHARE = 0.9
+# has shrunk is a short export or has lost its coordinates. The hundredth it
+# may lose is over a month of incidents, far more than corrections to the
+# feed take away from one day to the next.
+MIN_REFRESH_ROW_SHARE = 0.99
+# A refresh is refused as well if it ends more than this many days before the
+# copy in use: an export cut short by date can keep nearly all of its rows.
+# The last day can move back by one or two when the feed is corrected.
+MAX_REFRESH_DAYS_LOST = 3
 
-# Cache settings (in seconds)
+# A load is refused if the feed ends more than this many days before today.
+# The export runs a few days behind; one that ends a month back has been cut
+# short, or the portal has stopped updating it, and either way the figures
+# for the year so far would be wrong without a word. This is the only check
+# a first load can be put to, with no earlier copy to compare it with.
+MAX_FEED_LAG_DAYS = 30
+
+# Cache settings (in seconds). The dataset's age and the waits after a failure
+# are measured by the wall clock, so the hours a sleeping host spends
+# suspended count towards them.
 DATA_CACHE_TTL = 86400  # 24 hours
 # After a failed refresh the previous data stays in use; wait this long before
 # trying the download again.
@@ -83,6 +98,12 @@ DOWNLOAD_READ_TIMEOUT = 60
 # see only a spinner: this bounds that to a few minutes with a stalled portal.
 # A download that is still coming in is not cut off by it.
 DOWNLOAD_RETRY_BUDGET = 120
+# How long one download attempt may take from start to finish. The read
+# timeout only counts silence, so a download that trickles in would otherwise
+# never be given up on, and no other load can start while it runs. The export
+# is some 340 MB and usually arrives in seconds: this allows for a line a
+# hundred times slower.
+DOWNLOAD_ATTEMPT_TIMEOUT = 1800  # 30 minutes
 FORECAST_CACHE_TTL = 3600  # 1 hour
 YOY_CACHE_TTL = 1800  # 30 minutes
 

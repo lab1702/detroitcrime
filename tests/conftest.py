@@ -58,11 +58,16 @@ def make_raw_feed(start="2024-06-01", end="2026-03-31 23:00", per_day=8, seed=0)
     })
 
 
-def clean_feed(raw: pd.DataFrame) -> pd.DataFrame:
-    """Clean a raw feed with the settings app.py uses."""
+def clean_feed(raw: pd.DataFrame, today=None) -> pd.DataFrame:
+    """Clean a raw feed with the settings app.py uses.
+
+    `today` is the day the feed is taken to be loaded on; left out, it is the
+    current date, or the one a test has set for the app.
+    """
     return clean_and_filter_data(
         raw.copy(), MIN_DATE,
         (DETROIT_LAT_MIN, DETROIT_LAT_MAX), (DETROIT_LON_MIN, DETROIT_LON_MAX),
+        today=today,
     )
 
 

@@ -21,7 +21,7 @@ from constants import (
 from utils import (
     NO_CHANGE, TRANSIENT_ERRORS, DataNotReadyError, LoadFailedError, validate_data, safe_load_data_from_url,
     clean_and_filter_data, compute_yoy_deltas, daily_incident_counts, dataset_cache, format_daily_rate,
-    is_timeout, is_transient_error, selection_period,
+    is_timeout, is_transient_error, refuse_stale_feed, selection_period,
 )
 from theme import inject_css, apply_dark_plotly, BLUE_ACCENT, CATEGORY_CARD_KEY, GREEN_ACCENT, RED_ACCENT
 
@@ -54,6 +54,9 @@ def fetch_data() -> pd.DataFrame:
             "no incidents were left after cleaning; "
             "the dates or coordinates in the feed may have changed"
         )
+    # An export cut short can lose its latest months and still pass everything
+    # above. A refresh is held against the copy in use as well, by the cache.
+    refuse_stale_feed(df)
     return df
 
 
@@ -388,6 +391,8 @@ def main() -> None:
     # is emptied when the run ends. Session state lasts as long as the browser
     # tab stays open: left there, every idle tab would keep its own copy of a
     # selection in memory, and after a refresh the whole previous dataset.
+    # For the same reason each page works on it inside a function: at the top
+    # level of a page script it would outlive the run in the script's namespace.
     run_data = {
         "df_filtered": df_filtered,
         # The category selection across every year, which the forecast is fitted on

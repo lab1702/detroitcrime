@@ -1,9 +1,11 @@
 """Page-level tests, run headlessly with Streamlit's AppTest."""
 
 import base64
+import gc
 import json
 import threading
 import warnings
+import weakref
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -98,6 +100,17 @@ def clear_caches():
     st.cache_data.clear()
     st.cache_resource.clear()
     yield
+
+
+# The day the app is taken to be running on: two days after the synthetic
+# feed ends, as the real export runs a few days behind. By the real date the
+# feed would end long ago, and be refused as cut short.
+TODAY = date(2026, 4, 2)
+
+
+@pytest.fixture(autouse=True)
+def today(monkeypatch):
+    monkeypatch.setattr(utils, "local_today", lambda timezone=None: TODAY)
 
 
 # ── Navigation ───────────────────────────────────────────────────────────────
@@ -230,6 +243,40 @@ def test_no_dataframe_is_left_in_session_state(raw_feed, monkeypatch):
     at.switch_page("views/3_Geography.py").run()
     assert not at.exception
     assert at.session_state["run_data"] == {}
+
+
+def frames_in_memory() -> list[pd.DataFrame]:
+    return [found for found in gc.get_objects() if isinstance(found, pd.DataFrame)]
+
+
+@pytest.mark.parametrize("page", [
+    None, "views/2_Trends.py", "views/3_Geography.py", "views/4_Analysis.py", "views/5_Map.py",
+], ids=["Overview", "Trends", "Geography", "Pivot Analysis", "Map"])
+def test_page_lets_go_of_its_data_when_the_run_ends(raw_feed, monkeypatch, page):
+    # An empty `run_data` is not the whole of it. A page that kept the data at
+    # the top level of its script went on holding it there: the Pivot page for
+    # as long as the tab stayed open (through the Swap button's callback), the
+    # others until Python next looked for unreachable objects.
+    at = run_app(raw_feed, monkeypatch)
+    # One year: a selection of this tab's own, not the dataset every tab shares
+    at.sidebar.selectbox[1].select(2025).run()
+    if page:
+        at.switch_page(page).run()
+    assert not at.exception, at.exception
+
+    gc.collect()
+    there_before = [weakref.ref(frame) for frame in frames_in_memory()]
+    gc.disable()  # what is let go of is let go of by the run ending, not by a collection
+    try:
+        at.run()
+        assert not at.exception, at.exception
+        left_behind = [
+            frame.shape for frame in frames_in_memory()
+            if not any(known() is frame for known in there_before)
+        ]
+    finally:
+        gc.enable()
+    assert left_behind == []
 
 
 def test_current_year_keeps_its_change_from_last_year(overview):
@@ -481,10 +528,12 @@ def test_failed_refresh_keeps_showing_the_last_data(overview, monkeypatch):
     assert {m.label for m in overview.metric} >= {"Total Incidents", "Avg Daily"}
 
 
-def test_refreshed_data_is_shown_on_the_run_after_it_arrives(overview, raw_feed, monkeypatch):
-    # The feed has lost its last month by the time the data is due for a refresh
-    shorter = raw_feed[raw_feed["incident_occurred_at"] < "2026/03/01"]
-    download, release = held_back(shorter)
+def test_refreshed_data_is_shown_on_the_run_after_it_arrives(raw_feed, monkeypatch):
+    # The copy in use was loaded three days ago; the feed has those days by
+    # the time the data is due for a refresh
+    earlier = raw_feed[raw_feed["incident_occurred_at"] < "2026/03/29"]
+    overview = run_app(earlier, monkeypatch)
+    download, release = held_back(raw_feed)
     monkeypatch.setattr(utils, "safe_load_data_from_url", download)
     before = {m.label: m.value for m in overview.metric}["Total Incidents"]
     utils.dataset_cache().expire()
@@ -716,9 +765,65 @@ def test_refresh_that_has_lost_most_of_its_incidents_is_refused(overview, raw_fe
     assert "restart" not in warning
 
 
+def test_refresh_that_ends_days_earlier_is_refused(overview, raw_feed, monkeypatch):
+    before = {m.label: m.value for m in overview.metric}
+
+    # An export cut short by date, five days before the copy in use ends
+    # (local midnight on 27 Mar is 04:00 UTC). It has all but 40 of its 5,344
+    # incidents: too few are gone for it to be refused as shrunken.
+    cut_short = raw_feed[raw_feed["incident_occurred_at"] < "2026/03/27 04:00:00+00"]
+    monkeypatch.setattr(utils, "safe_load_data_from_url", lambda url, **kwargs: cut_short.copy())
+    utils.dataset_cache().expire()
+    overview.run()
+    assert utils.dataset_cache().wait(timeout=TIMEOUT)
+    overview.run()
+    assert not overview.exception and not overview.error
+
+    assert {m.label: m.value for m in overview.metric} == before
+    assert [w.value for w in overview.warning] == [
+        "The data could not be refreshed, so the last copy that loaded is shown. "
+        "Data validation error: the refreshed feed ends on 2026-03-25, 5 days before the copy shown; "
+        "it may be incomplete"
+    ]
+
+
+def test_first_load_of_a_feed_that_ends_long_ago_is_refused(raw_feed, monkeypatch):
+    # An export cut short by date: everything but the last two months. It has
+    # nine in ten of its incidents, and with no earlier copy to hold it
+    # against it used to be shown as the whole dataset.
+    cut_short = raw_feed[raw_feed["incident_occurred_at"] < "2026/02/01"]
+    monkeypatch.setattr(utils, "safe_load_data_from_url", lambda url, **kwargs: cut_short.copy())
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
+    at.run()
+    assert [e.value for e in at.error] == [
+        "Data validation error: the feed ends on 2026-01-30, 62 days ago; it may be incomplete, "
+        "or the portal may have stopped updating it"
+    ]
+    assert not at.metric
+    # The same export would be refused again, at the cost of a whole download:
+    # the page tries again no sooner than the cache will
+    assert [c.value for c in at.caption] == [LATER_NOTE]
+
+    # The whole export is taken once the wait before another try is over
+    monkeypatch.setattr(utils, "safe_load_data_from_url", lambda url, **kwargs: raw_feed.copy())
+    utils.dataset_cache().expire()
+    at.run()
+    assert not at.error
+    assert at.metric
+
+
+def test_feed_a_few_weeks_behind_is_shown(raw_feed, clean_df, monkeypatch):
+    # The export runs behind, at times by more than its usual few days
+    monkeypatch.setattr(utils, "local_today", lambda timezone=None: date(2026, 4, 29))
+    at = run_app(raw_feed, monkeypatch)
+    assert not at.error
+    assert {m.label: m.value for m in at.metric}["Total Incidents"] == f"{len(clean_df):,}"
+
+
 def test_filters_are_kept_when_a_refresh_changes_their_options(raw_feed, monkeypatch):
-    # A feed with only the last month of 2024 (local midnight on 1 Dec is 05:00 UTC)
-    first = raw_feed[raw_feed["incident_occurred_at"] >= "2024/12/01 05:00:00+00"]
+    # A feed with only the last two days of 2024 (local midnight on 30 Dec is
+    # 05:00 UTC): few enough that a refresh without them is not refused as shrunken
+    first = raw_feed[raw_feed["incident_occurred_at"] >= "2024/12/30 05:00:00+00"]
     overview = run_app(first, monkeypatch)
     assert overview.sidebar.selectbox[1].options == ["All", "2024", "2025", "2026"]
     overview.sidebar.selectbox[0].select("CATEGORY 03").run()
@@ -746,12 +851,12 @@ def test_filters_are_kept_when_a_refresh_changes_their_options(raw_feed, monkeyp
 
 
 def test_filter_that_is_no_longer_offered_falls_back_to_all(overview, raw_feed, monkeypatch):
-    overview.sidebar.selectbox[0].select("CATEGORY 12").run()
+    overview.sidebar.selectbox[0].select("CATEGORY 20").run()
     overview.sidebar.selectbox[1].select(2025).run()
 
-    # The category has gone from the refreshed feed (one in twenty incidents:
-    # a feed that had lost many more would be refused as incomplete)
-    without = raw_feed[raw_feed["offense_category"] != "CATEGORY 12"]
+    # The category has gone from the refreshed feed (the rarest, well under one
+    # incident in a hundred: a feed that had lost more would be refused as incomplete)
+    without = raw_feed[raw_feed["offense_category"] != "CATEGORY 20"]
     monkeypatch.setattr(utils, "safe_load_data_from_url", lambda url, **kwargs: without.copy())
     utils.dataset_cache().expire()
     overview.run()
@@ -760,7 +865,7 @@ def test_filter_that_is_no_longer_offered_falls_back_to_all(overview, raw_feed, 
     assert not overview.exception
 
     category, year = overview.sidebar.selectbox
-    assert "CATEGORY 12" not in category.options
+    assert "CATEGORY 20" not in category.options
     assert (category.value, year.value) == ("All", 2025)
     in_2025 = clean_feed(without)["incident_year"] == 2025
     assert {m.label: m.value for m in overview.metric}["Total Incidents"] == f"{in_2025.sum():,}"
@@ -984,7 +1089,7 @@ def test_current_year_is_marked_as_part_of_one_before_it_is_projected():
 def test_projection_counts_from_the_first_day_of_data():
     # The data starts on 1 February of the current year: at 8 a day the year
     # comes to 2,920, not to the 2,417 of a count taken to run from 1 January
-    df = clean_feed(make_raw_feed(start="2026-02-01", end="2026-06-30 23:00"))
+    df = clean_feed(make_raw_feed(start="2026-02-01", end="2026-06-30 23:00"), today=date(2026, 7, 2))
     at = run_page("2_Trends.py", make_page_state(df))
     yoy = next(f for f in plotly_figures(at) if f["data"][0]["type"] == "bar")
     actual, projected = yoy["data"]

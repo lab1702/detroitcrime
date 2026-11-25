@@ -3,8 +3,9 @@
 import gc
 import logging
 import threading
+import time
 import weakref
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import plotly.express as px
@@ -642,6 +643,48 @@ class TestDownload:
             safe_load_data_from_url(URL, retry_budget=120)
         assert attempts == [0, 60]
 
+    def test_download_that_trickles_in_is_given_up_on(self, monkeypatch):
+        # A byte every half minute is not silence, so the read timeout never
+        # ends it. It used to run for as long as the portal kept it up, with
+        # every later load waiting behind it.
+        clock = SteppedTime()
+        attempts = []
+
+        class Trickle(FakeResponse):
+            def iter_content(self, chunk_size):
+                for piece in super().iter_content(chunk_size):
+                    clock.now += 30
+                    yield piece
+
+        def trickling(*args, **kwargs):
+            attempts.append(clock.now)
+            return Trickle(b"latitude,offense_category\n" + b"42.3,ARSON\n" * 10)
+
+        monkeypatch.setattr(utils, "time", clock)
+        monkeypatch.setattr(utils.requests, "get", trickling)
+        with pytest.raises(requests.exceptions.Timeout, match="still coming in after 100 seconds") as slow:
+            safe_load_data_from_url(URL, attempt_timeout=100)
+        # It is told as a portal that took too long, and may do better later
+        assert utils.is_timeout(slow.value) and utils.is_transient_error(slow.value)
+        # Given up during the fourth piece, 120 seconds in: by then the time
+        # for another attempt is spent as well
+        assert (attempts, clock.now) == ([0], 120)
+
+    def test_slow_download_that_ends_in_time_is_taken(self, monkeypatch):
+        clock = SteppedTime()
+
+        class Slow(FakeResponse):
+            def iter_content(self, chunk_size):
+                for piece in super().iter_content(chunk_size):
+                    clock.now += 30
+                    yield piece
+
+        monkeypatch.setattr(utils, "time", clock)
+        monkeypatch.setattr(utils.requests, "get", lambda *args, **kwargs: Slow())
+        # Seven pieces, three and a half minutes: within the time one attempt may take
+        assert len(safe_load_data_from_url(URL, attempt_timeout=600)) == 2
+        assert utils.DOWNLOAD_ATTEMPT_TIMEOUT >= 600
+
     def test_silence_in_the_middle_of_a_download_is_a_timeout_too(self):
         # `requests` does not call it one: it wraps urllib3's error in a
         # ConnectionError (seen with a local server that stops mid-body)
@@ -1170,33 +1213,76 @@ class TestRefreshingCache:
     def test_not_at_rest_before_anything_has_loaded(self, cache):
         assert not cache.at_rest(0)
 
+    def test_age_is_told_by_the_wall_clock_unless_another_is_given(self):
+        # A monotonic clock stands still on Linux while the machine is asleep:
+        # a value loaded before a night's sleep would be hours younger than it is
+        assert RefreshingCache(ttl=100, retry_interval=10)._clock is time.time
+
+    def test_value_dated_in_the_future_is_due(self, cache, clock):
+        # The wall clock can be set back. How old the value is cannot be told
+        # then, and it must not pass for fresh for as long as the clock was ahead.
+        value, error, version = cache.get_versioned(loader("first"))
+        clock.now -= 5000
+        assert not cache.at_rest(version)
+        assert cache.get(loader("second")) == ("first", None)
+        assert cache.wait(timeout=5)
+        value, error, version = cache.get_versioned(loader())
+        assert (value, error) == ("second", None)
+        # Dated by the clock as it now is, the new value is fresh for its time to live
+        clock.now += 99
+        assert cache.at_rest(version)
+
+    def test_failure_dated_in_the_future_is_tried_again(self, cache, clock):
+        with pytest.raises(LoadFailedError):
+            cache.get(loader(RuntimeError("portal down")))
+        clock.now -= 5000
+        assert cache.get(loader("first")) == ("first", None)
+
 
 class TestShrunkenRefresh:
     @staticmethod
-    def rows(count: int) -> pd.DataFrame:
-        return pd.DataFrame({"latitude": [42.33] * count})
+    def rows(count: int, end: date = date(2026, 3, 30)) -> pd.DataFrame:
+        """A cleaned dataset of `count` incidents, the last of them on `end`."""
+        return pd.DataFrame({"latitude": [42.33] * count, "date": [end] * count})
 
     def test_refresh_that_grows_or_loses_a_little_is_taken(self):
         refuse_shrunken_refresh(self.rows(1010), self.rows(1000))
         refuse_shrunken_refresh(self.rows(1000), self.rows(1000))
-        refuse_shrunken_refresh(self.rows(900), self.rows(1000))
+        refuse_shrunken_refresh(self.rows(990), self.rows(1000))
 
-    def test_refresh_that_has_lost_much_of_its_rows_is_refused(self):
-        with pytest.raises(ValueError, match="only 899 usable incidents, against 1,000 in the copy shown"):
-            refuse_shrunken_refresh(self.rows(899), self.rows(1000))
+    def test_refresh_that_has_lost_incidents_is_refused(self):
+        # One in ten used to be let go: 75,000 incidents of the real feed,
+        # most of a year, in an export made while the portal reloads its data
+        with pytest.raises(ValueError, match="only 989 usable incidents, against 1,000 in the copy shown"):
+            refuse_shrunken_refresh(self.rows(989), self.rows(1000))
+        with pytest.raises(ValueError, match="only 950 usable incidents"):
+            refuse_shrunken_refresh(self.rows(950), self.rows(1000))
+
+    def test_refresh_that_ends_days_earlier_is_refused(self):
+        # Cut short by date it can keep nearly every row, and the day the
+        # year so far is measured up to moves back
+        with pytest.raises(ValueError, match="ends on 2026-03-26, 4 days before the copy shown"):
+            refuse_shrunken_refresh(self.rows(1000, end=date(2026, 3, 26)), self.rows(1000))
+        # The last day can move back a little when the feed is corrected, and
+        # moves on from day to day
+        refuse_shrunken_refresh(self.rows(1000, end=date(2026, 3, 27)), self.rows(1000))
+        refuse_shrunken_refresh(self.rows(1000, end=date(2026, 3, 31)), self.rows(1000))
 
     def test_what_to_do_about_a_refused_refresh_is_for_the_log_not_the_page(self, caplog):
         with caplog.at_level(logging.WARNING, logger="utils"):
-            with pytest.raises(ValueError) as refused:
-                refuse_shrunken_refresh(self.rows(899), self.rows(1000))
-        # The message is shown to every visitor, who cannot restart anything
-        assert "restart" not in str(refused.value)
+            with pytest.raises(ValueError) as shrunken:
+                refuse_shrunken_refresh(self.rows(989), self.rows(1000))
+            with pytest.raises(ValueError) as cut_short:
+                refuse_shrunken_refresh(self.rows(1000, end=date(2026, 3, 1)), self.rows(1000))
+        # The messages are shown to every visitor, who cannot restart anything
+        assert "restart" not in str(shrunken.value) and "restart" not in str(cut_short.value)
         assert "against 1000 in the copy in use" in caplog.text
-        assert "restart the app to accept it" in caplog.text
+        assert "ends on 2026-03-01, against 2026-03-30 in the copy in use" in caplog.text
+        assert caplog.text.count("restart the app to accept it") == 2
 
     def test_refresh_that_is_taken_is_not_logged(self, caplog):
         with caplog.at_level(logging.WARNING, logger="utils"):
-            refuse_shrunken_refresh(self.rows(900), self.rows(1000))
+            refuse_shrunken_refresh(self.rows(990), self.rows(1000))
         assert not caplog.records
 
     def test_dataset_cache_checks_its_refreshes(self):
@@ -1215,8 +1301,57 @@ class TestShrunkenRefresh:
             assert cache._can_pass is utils.is_transient_error
             assert not utils.is_transient_error(error)
             assert cache._max_retry_interval == utils.DATA_MAX_RETRY_INTERVAL < utils.DATA_CACHE_TTL
+            # The dataset's age is told by a clock that counts the hours a host sleeps
+            assert cache._clock is time.time
         finally:
             utils.st.cache_resource.clear()
+
+
+class TestStaleFeed:
+    TODAY = date(2026, 4, 2)
+
+    @staticmethod
+    def ending(last_day: date) -> pd.DataFrame:
+        """A cleaned dataset whose incidents end on `last_day`."""
+        return pd.DataFrame({"date": [date(2018, 1, 1), last_day - timedelta(days=1), last_day]})
+
+    def test_feed_a_few_days_or_weeks_behind_is_taken(self):
+        # The export runs a few days behind, and more than that now and then
+        utils.refuse_stale_feed(self.ending(date(2026, 3, 30)), self.TODAY)
+        utils.refuse_stale_feed(self.ending(date(2026, 3, 3)), self.TODAY)  # 30 days
+
+    def test_feed_that_ends_long_ago_is_refused(self):
+        # Cut short, or no longer updated: either way the year so far would
+        # be measured up to a day long past
+        with pytest.raises(ValueError, match="the feed ends on 2026-03-02, 31 days ago"):
+            utils.refuse_stale_feed(self.ending(date(2026, 3, 2)), self.TODAY)
+        with pytest.raises(ValueError, match="the feed ends on 2025-09-30, 184 days ago"):
+            utils.refuse_stale_feed(self.ending(date(2025, 9, 30)), self.TODAY)
+
+    def test_today_defaults_to_the_current_local_date(self):
+        yesterday = utils.local_today() - timedelta(days=1)
+        utils.refuse_stale_feed(self.ending(yesterday))
+        with pytest.raises(ValueError, match="days ago"):
+            utils.refuse_stale_feed(self.ending(yesterday - timedelta(days=60)))
+        # The date is that of the place asked for, not of the server: these
+        # two are 25 hours apart, so never on the same day
+        assert utils.local_today("Pacific/Kiritimati") > utils.local_today("Pacific/Pago_Pago")
+
+    def test_what_to_do_about_a_feed_that_has_stopped_is_for_the_log_not_the_page(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="utils"):
+            with pytest.raises(ValueError) as refused:
+                utils.refuse_stale_feed(self.ending(date(2026, 1, 30)), self.TODAY)
+        # The message is shown to every visitor, who cannot change a setting
+        assert "MAX_FEED_LAG_DAYS" not in str(refused.value)
+        assert "ends on 2026-01-30, 62 days ago" in caplog.text
+        assert "raise MAX_FEED_LAG_DAYS" in caplog.text
+
+    def test_the_load_is_not_one_that_can_pass_by_itself(self):
+        # The same export would be refused again, at the cost of a whole
+        # download: the cache tries it less and less often
+        with pytest.raises(ValueError) as refused:
+            utils.refuse_stale_feed(self.ending(date(2026, 1, 30)), self.TODAY)
+        assert not utils.is_transient_error(refused.value)
 
 
 class TestAccentColors:

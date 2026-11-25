@@ -21,8 +21,9 @@ from urllib3.exceptions import ReadTimeoutError
 
 from constants import (
     CODE_LABEL_PREFIXES, DATA_CACHE_TTL, DATA_FIRST_LOAD_RETRY_INTERVAL, DATA_MAX_RETRY_INTERVAL,
-    DATA_RETRY_INTERVAL, DAY_LABELS, DOWNLOAD_READ_TIMEOUT, DOWNLOAD_RETRY_BUDGET,
-    HOLIDAY_SHORT_NAMES, LOCAL_TIMEZONE, MAX_HOLIDAY_LABEL_LENGTH, MAX_UNPARSEABLE_DATE_SHARE,
+    DATA_RETRY_INTERVAL, DAY_LABELS, DOWNLOAD_ATTEMPT_TIMEOUT, DOWNLOAD_READ_TIMEOUT,
+    DOWNLOAD_RETRY_BUDGET, HOLIDAY_SHORT_NAMES, LOCAL_TIMEZONE, MAX_FEED_LAG_DAYS,
+    MAX_HOLIDAY_LABEL_LENGTH, MAX_REFRESH_DAYS_LOST, MAX_UNPARSEABLE_DATE_SHARE,
     MIN_LAST_DAY_SHARE, MIN_PROJECTION_DAYS, MIN_REFRESH_ROW_SHARE, NUMBER_COLUMNS,
     REQUIRED_COLUMNS, TEXT_COLUMNS,
 )
@@ -195,9 +196,16 @@ def _has_rows(csv_file: IO[bytes]) -> bool:
     return any(line.strip() for line in csv_file)
 
 
+# The download is read in pieces of at most this many bytes. The time an
+# attempt has taken is looked at as each piece arrives, so they are kept small
+# enough to arrive often on a slow line.
+DOWNLOAD_CHUNK_SIZE = 64 * 1024
+
+
 def safe_load_data_from_url(url: str, timeout: int = DOWNLOAD_READ_TIMEOUT, max_retries: int = 5,
                             usecols: Optional[Iterable[str]] = None,
-                            retry_budget: float = DOWNLOAD_RETRY_BUDGET) -> pd.DataFrame:
+                            retry_budget: float = DOWNLOAD_RETRY_BUDGET,
+                            attempt_timeout: float = DOWNLOAD_ATTEMPT_TIMEOUT) -> pd.DataFrame:
     """
     Safely load data from URL with application-level retries.
 
@@ -224,6 +232,12 @@ def safe_load_data_from_url(url: str, timeout: int = DOWNLOAD_READ_TIMEOUT, max_
             no further attempt is started. With `timeout` it bounds how long a
             stalled portal is waited for; a download that is still coming in
             is not cut off by it.
+        attempt_timeout: Seconds one attempt may take from start to finish.
+            A download that is still coming in after that is given up as too
+            slow (a Timeout): `timeout` only counts silence, and would let
+            one that trickles in run for ever, with every later load waiting
+            behind it. It is looked at as each piece of the download arrives,
+            so an attempt overruns it by the time its last piece took.
 
     Returns:
         DataFrame
@@ -231,7 +245,8 @@ def safe_load_data_from_url(url: str, timeout: int = DOWNLOAD_READ_TIMEOUT, max_
     Raises:
         DataNotReadyError: the portal answered without the CSV, or with one
             that is empty or has no rows
-        requests.exceptions.RequestException: the download failed
+        requests.exceptions.RequestException: the download failed, or took
+            longer than `attempt_timeout`
         ValueError: the file could not be parsed
     """
     if max_retries < 1:
@@ -244,6 +259,7 @@ def safe_load_data_from_url(url: str, timeout: int = DOWNLOAD_READ_TIMEOUT, max_
     attempt = 0
     while True:
         attempt += 1
+        attempt_started = time.monotonic()
         try:
             with tempfile.TemporaryFile() as buffer:
                 with requests.get(url, timeout=(15, timeout), stream=True) as response:
@@ -254,7 +270,12 @@ def safe_load_data_from_url(url: str, timeout: int = DOWNLOAD_READ_TIMEOUT, max_
                             f"the portal answered with status {response.status_code} instead of the data"
                         )
                     checked = False
-                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                        # Still coming in, but too slowly ever to be worth the wait
+                        if time.monotonic() - attempt_started > attempt_timeout:
+                            raise requests.exceptions.Timeout(
+                                f"the download was still coming in after {attempt_timeout:,.0f} seconds"
+                            )
                         if not chunk:
                             continue
                         if not checked:
@@ -367,7 +388,12 @@ class RefreshingCache:
         first_retry_interval: The same for a failed first load, which leaves
             nothing to show and so is usually tried again sooner. Defaults to
             `retry_interval`.
-        clock: Source of the current time, in seconds
+        clock: Source of the current time, in seconds. Defaults to the wall
+            clock, which goes on counting while the machine is asleep: by a
+            monotonic clock, which on Linux stands still then, a value loaded
+            before a night's sleep is hours younger than it is. The wall
+            clock can be set back; a value or a failure that it dates in the
+            future is taken to be due.
         check: Called on the cache's thread with (new value, value in use)
             when a refresh has loaded. If it raises, the new value is refused
             and the refresh counts as failed. A first load has nothing to be
@@ -385,7 +411,7 @@ class RefreshingCache:
 
     def __init__(self, ttl: float, retry_interval: float,
                  first_retry_interval: Optional[float] = None,
-                 clock: Callable[[], float] = time.monotonic,
+                 clock: Callable[[], float] = time.time,
                  check: Optional[Callable[[Any, Any], None]] = None,
                  can_pass: Optional[Callable[[BaseException], bool]] = None,
                  max_retry_interval: Optional[float] = None) -> None:
@@ -466,12 +492,19 @@ class RefreshingCache:
         raise LoadFailedError(str(load.error), load.version) from load.error
 
     def _fresh(self) -> bool:
-        """Whether there is a value that is not yet due for a refresh. Called with the lock held."""
-        return self._has_value and self._clock() - self._loaded_at < self._ttl
+        """Whether there is a value that is not yet due for a refresh. Called with the lock held.
+
+        One loaded later than now (the clock has been set back) is due: how
+        old it really is cannot be told any more.
+        """
+        return self._has_value and 0 <= self._clock() - self._loaded_at < self._ttl
 
     def _left_alone(self) -> bool:
-        """Whether the last load failed too recently to be tried again. Called with the lock held."""
-        return self._failed_at is not None and self._clock() - self._failed_at < self._retry_wait
+        """Whether the last load failed too recently to be tried again. Called with the lock held.
+
+        As for a value, a failure later than now is not left alone.
+        """
+        return self._failed_at is not None and 0 <= self._clock() - self._failed_at < self._retry_wait
 
     def _run(self, loader: Callable[[], Any], load: _Load) -> None:
         """Run one load on the cache's thread and record how it ended."""
@@ -573,21 +606,26 @@ class RefreshingCache:
 
 
 def refuse_shrunken_refresh(new: pd.DataFrame, previous: pd.DataFrame) -> None:
-    """Refuse a refreshed dataset that has lost a large share of its incidents.
+    """Refuse a refreshed dataset that has lost incidents, or its latest days.
 
-    From one day to the next the feed grows. One that comes back with far
-    fewer incidents than the copy in use is a short export, or has lost the
-    coordinates its rows are kept by, and taking it would understate every
-    figure without a word. Refused, the copy in use stays and the pages say
-    that the refresh failed.
+    From one day to the next the feed grows, and ends a day later. One that
+    comes back with fewer incidents than the copy in use is a short export,
+    or has lost the coordinates its rows are kept by; one that ends days
+    earlier has been cut short by date, which can cost it only a few of its
+    rows. Taking either would understate the figures without a word. Refused,
+    the copy in use stays and the pages say that the refresh failed.
 
     What to do if the feed really has shrunk is written to the log, for
     whoever runs the app. The message raised is shown to every visitor, who
     can do nothing about it.
 
+    Args:
+        new: The cleaned dataset the refresh has loaded
+        previous: The cleaned dataset in use
+
     Raises:
         ValueError: `new` has fewer than MIN_REFRESH_ROW_SHARE of the rows of
-            `previous`
+            `previous`, or ends more than MAX_REFRESH_DAYS_LOST days before it
     """
     if len(new) < len(previous) * MIN_REFRESH_ROW_SHARE:
         logger.warning(
@@ -598,6 +636,64 @@ def refuse_shrunken_refresh(new: pd.DataFrame, previous: pd.DataFrame) -> None:
         raise ValueError(
             f"the refreshed feed has only {len(new):,} usable incidents, against {len(previous):,} "
             "in the copy shown; it may be incomplete or have lost its coordinates"
+        )
+
+    new_end, previous_end = new["date"].max(), previous["date"].max()
+    days_lost = (previous_end - new_end).days
+    if days_lost > MAX_REFRESH_DAYS_LOST:
+        logger.warning(
+            "Refusing a refresh that ends on %s, against %s in the copy in use. "
+            "If the feed really has lost those days, restart the app to accept it.",
+            new_end, previous_end,
+        )
+        raise ValueError(
+            f"the refreshed feed ends on {new_end}, {days_lost} days before the copy shown; "
+            "it may be incomplete"
+        )
+
+
+def local_today(timezone: str = LOCAL_TIMEZONE) -> date:
+    """Today's date where the incidents happen, whatever the server's own clock is set to."""
+    return pd.Timestamp.now(tz=timezone).date()
+
+
+def refuse_stale_feed(df: pd.DataFrame, today: Optional[date] = None) -> None:
+    """Refuse a cleaned dataset that ends long before today.
+
+    The export runs a few days behind. One whose last incidents are weeks
+    old has been cut short (a partial export, made while the portal reloads
+    its data, can hold everything but the latest months), or the portal has
+    stopped updating it. Shown as it is, the year so far would be measured up
+    to a day long past and set against a last year that is complete.
+
+    This is the one check a first load can be put to: there is no earlier
+    copy to hold it against (see `refuse_shrunken_refresh`). It cannot tell
+    an export that is thin throughout from a quieter city.
+
+    What to do if the portal really has stopped is written to the log, for
+    whoever runs the app. The message raised is shown to every visitor.
+
+    Args:
+        df: Cleaned dataset, with the local day of each incident in `date`
+        today: Current local date. Defaults to `local_today()`.
+
+    Raises:
+        ValueError: the last day in `df` is more than MAX_FEED_LAG_DAYS
+            before `today`
+    """
+    if today is None:
+        today = local_today()
+    last_day = df["date"].max()
+    days_behind = (today - last_day).days
+    if days_behind > MAX_FEED_LAG_DAYS:
+        logger.warning(
+            "Refusing a feed that ends on %s, %d days ago. If the portal has stopped "
+            "updating it, raise MAX_FEED_LAG_DAYS in constants.py to show it as it is.",
+            last_day, days_behind,
+        )
+        raise ValueError(
+            f"the feed ends on {last_day}, {days_behind} days ago; it may be incomplete, "
+            "or the portal may have stopped updating it"
         )
 
 
@@ -716,7 +812,7 @@ def clean_and_filter_data(df: pd.DataFrame, min_date: str,
     # and mistyped future ones: those would otherwise be taken for the most
     # recent day below and skew every year-to-date figure.
     if today is None:
-        today = pd.Timestamp.now(tz=local_timezone).date()
+        today = local_today(local_timezone)
     tomorrow = pd.Timestamp(today) + pd.Timedelta(days=1)
     df = df[(df['incident_occurred_at'] >= min_date) & (df['incident_occurred_at'] < tomorrow)].copy()
 
