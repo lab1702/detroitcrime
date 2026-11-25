@@ -5,11 +5,24 @@ import pandas as pd
 import plotly.express as px
 
 from constants import CHART_HEIGHT, PIVOT_COLUMNS, COLOR_SCALE_HEATMAP, CODE_LABEL_PREFIXES
-from utils import code_labels, numeric_codes
+from utils import code_labels, day_labels, numeric_codes
 from theme import inject_css, apply_dark_plotly, TEAL_ACCENT
 
 # Numeric fields shown on a continuous axis that should only tick on whole numbers
-WHOLE_NUMBER_FIELDS = {"incident_year", "incident_day_of_week"}
+WHOLE_NUMBER_FIELDS = {"incident_year"}
+
+
+def axis_labels(field: str, values) -> list[str] | None:
+    """Names for a pivot axis, or None when its values are shown as they are.
+
+    Precinct, district and zip codes get their prefix, and the feed's day
+    numbers their names (a bare 1 could be Sunday or Monday).
+    """
+    if field in CODE_LABEL_PREFIXES:
+        return code_labels(values, CODE_LABEL_PREFIXES[field])
+    if field == "incident_day_of_week":
+        return day_labels(values)
+    return None
 
 inject_css()
 
@@ -69,15 +82,17 @@ try:
         codes = numeric_codes(df_sub[field])
         df_sub = df_sub.assign(**{field: codes})[codes != 0]
 
-    # Counts rows, so every incident in the selection is included
+    # Counts rows. An incident with no value for one of the fields has no cell
+    # to be counted in; how many there are is reported under the table.
     pivot_table = pd.pivot_table(df_sub, index=rows, columns=columns, aggfunc="size", fill_value=0)
+    left_out = len(df_filtered) - int(pivot_table.to_numpy().sum())
 
-    if rows in CODE_LABEL_PREFIXES:
-        labels = code_labels(pivot_table.index, CODE_LABEL_PREFIXES[rows])
-        pivot_table.index = pd.Index(labels, name=rows)
-    if columns in CODE_LABEL_PREFIXES:
-        labels = code_labels(pivot_table.columns, CODE_LABEL_PREFIXES[columns])
-        pivot_table.columns = pd.Index(labels, name=columns)
+    row_labels = axis_labels(rows, pivot_table.index)
+    if row_labels is not None:
+        pivot_table.index = pd.Index(row_labels, name=rows)
+    column_labels = axis_labels(columns, pivot_table.columns)
+    if column_labels is not None:
+        pivot_table.columns = pd.Index(column_labels, name=columns)
 
     fig = px.imshow(
         pivot_table,
@@ -85,13 +100,13 @@ try:
         aspect="auto",
         color_continuous_scale=COLOR_SCALE_HEATMAP,
     )
-    # Code labels are categories even when they look like numbers (zip codes).
-    # Years and weekdays are numbers: tick on whole values only, not 2024.5.
-    if rows in CODE_LABEL_PREFIXES:
+    # Labels are categories even when they look like numbers (zip codes).
+    # Years are numbers: tick on whole values only, not 2024.5.
+    if row_labels is not None:
         fig.update_yaxes(type="category")
     elif rows in WHOLE_NUMBER_FIELDS:
         fig.update_yaxes(dtick=1)
-    if columns in CODE_LABEL_PREFIXES:
+    if column_labels is not None:
         fig.update_xaxes(type="category")
     elif columns in WHOLE_NUMBER_FIELDS:
         fig.update_xaxes(dtick=1)
@@ -101,6 +116,11 @@ try:
 
     st.subheader("Pivot Table Data")
     st.info(f"Table size: {pivot_table.shape[0]} rows × {pivot_table.shape[1]} columns")
+    if left_out:
+        fields = " or ".join(dict.fromkeys([rows, columns]))
+        st.caption(
+            f"{left_out:,} of {len(df_filtered):,} incidents have no {fields} and are not in the table."
+        )
     st.dataframe(pivot_table, width="stretch")
 
 except Exception as e:

@@ -112,6 +112,8 @@ detroitcrime/
 ### Data Loading (`fetch_data()` and `dataset_cache()`)
 - Fetches data from Detroit Open Data Portal, retrying network errors, rate limiting and server errors
 - Keeps the data for 24 hours, then refreshes it; if a refresh fails, the previous copy stays in use and a warning is shown
+- Downloads on a background thread shared by every session: visitors who arrive during a download wait for that one, and a click while waiting does not restart it
+- A failed first load is reported to every visitor and tried again after a minute, rather than repeated for each of them
 - Cleans and filters data for quality
 - Removes invalid coordinates and recent incomplete data
 
@@ -119,10 +121,10 @@ detroitcrime/
 
 The dashboard has five pages, all driven by the sidebar filters:
 
-1. **Overview**: KPI cards with year-over-year change, top categories (or offense descriptions when a category is selected), case status, daily incidents. The daily average is measured over the whole selected period, including days without incidents
+1. **Overview**: KPI cards with year-over-year change (shown for all years and for the current year), top categories (or offense descriptions when a category is selected), case status, daily incidents. The daily average is measured over the whole selected period, including days without incidents
 2. **Trends**: Daily incidents, year over year with a projection for the latest year, hour of day x day of week heatmap, 1-year Prophet forecast with holiday annotations. The forecast is fitted on every year of the selected category, so the Year filter does not apply to it
 3. **Geography**: Top neighborhoods, police precincts, council districts, zip codes and intersections
-4. **Pivot Analysis**: Interactive pivot table with customizable rows and columns
+4. **Pivot Analysis**: Interactive pivot table with customizable rows and columns. Incidents with no value for a chosen field cannot be placed in the table; a note under it says how many
 5. **Map**: Incident locations as colour-coded points (sampled above 250,000 points) or as a density heatmap
 
 ### Advanced Features
@@ -159,14 +161,15 @@ The application uses the following environment variables (set in docker-compose.
 ## Data Quality & Filtering
 
 The application implements several data quality measures:
-- Removes records with missing coordinates
+- Removes records with missing or non-numeric coordinates
 - Filters out invalid coordinates (latitude: 42.0-43.0, longitude: -84.0 to -82.0)
 - Converts feed timestamps from UTC to Detroit local time before deriving dates and years
 - Drops timestamps that cannot be read, and refuses the load if more than 1% of them are unreadable
 - Drops incidents dated after the current day
-- Excludes the most recent date to avoid incomplete data
+- Excludes the feed's last day, and anything dated after it, to avoid incomplete data. The last day is the latest one with at least 10% of a typical day's incidents, so a lone mistyped date is not taken for it
 - Filters data from 2018-01-01 onwards for consistency
-- Trims padded text values so the same value is not counted twice
+- Trims padded text values so the same value is not counted twice, and treats a value that is only padding as missing
+- Replaces bytes that are not valid UTF-8 instead of refusing the file
 
 ## Development Notes
 

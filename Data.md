@@ -52,12 +52,13 @@
 The application requires the following columns for proper functionality:
 - `latitude`, `longitude` - Geographic coordinates
 - `incident_occurred_at` - Date/time information
-- `incident_entry_id` - Unique identifier (required to be present; counts are by row)
 - `offense_category`, `offense_description` - Crime classification
 - `case_status` - Case status information
 - `police_precinct`, `council_district`, `neighborhood` - Geographic divisions
 - `zip_code`, `nearest_intersection` - Location details
 - `incident_day_of_week`, `incident_hour_of_day` - Temporal analysis
+
+Only these columns are loaded. The others, `incident_entry_id` included, are not read (counts are by row), so a change to them does not affect the app.
 
 ## Data Processing & Filtering
 
@@ -66,10 +67,11 @@ The application implements several data quality measures:
 - **Local Time**: `incident_occurred_at` is converted from UTC to Detroit time (`America/Detroit`); `date` and `incident_year` are derived from the local time
 - **Temporal Filtering**: Data from 2018-01-01 (local time) onwards; incidents dated after the current day are dropped
 - **Unreadable Timestamps**: Rows whose timestamp cannot be read are dropped; if more than 1% are unreadable the load is refused
-- **Text Cleanup**: Trailing padding is trimmed from category, description, status, neighborhood and intersection values
-- **Quality Control**: Removes records with missing coordinates or invalid values; a feed left with no rows is treated as a failed load
-- **Real-time Exclusion**: Excludes most recent date to avoid incomplete data
-- **Categorical Formatting**: Zip codes, precincts and districts are read as numeric codes; rows without a valid code are left out of charts that group by them
+- **Invalid Bytes**: A byte that is not valid UTF-8 is replaced with `�` instead of failing the load
+- **Text Cleanup**: Trailing padding is trimmed from category, description, status, neighborhood and intersection values; a value that is only padding is treated as missing
+- **Quality Control**: Removes records with missing, non-numeric or out-of-range coordinates; a feed left with no rows is treated as a failed load
+- **Real-time Exclusion**: Excludes the feed's last day, and anything dated after it, to avoid incomplete data. The last day is the latest one with at least 10% of a typical (median) day's incidents, so a lone row with a mistyped later date is not taken for it
+- **Categorical Formatting**: Zip codes, precincts and districts are read as numeric codes; rows without a valid whole-number code are left out of charts that group by them (the pivot says how many)
 
 ## Data Quality Notes
 

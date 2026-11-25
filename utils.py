@@ -5,9 +5,11 @@ and processing used throughout the crime dashboard application.
 """
 
 import calendar
+import logging
 import tempfile
 import threading
 import time
+import traceback
 from datetime import date
 from typing import Any, Callable, Iterable, Optional, Tuple
 
@@ -16,9 +18,12 @@ import requests
 import streamlit as st
 
 from constants import (
-    DATA_CACHE_TTL, DATA_RETRY_INTERVAL, LOCAL_TIMEZONE, MAX_UNPARSEABLE_DATE_SHARE,
-    MIN_PROJECTION_DAYS, REQUIRED_COLUMNS, TEXT_COLUMNS,
+    DATA_CACHE_TTL, DATA_FIRST_LOAD_RETRY_INTERVAL, DATA_RETRY_INTERVAL, DAY_LABELS,
+    LOCAL_TIMEZONE, MAX_UNPARSEABLE_DATE_SHARE, MIN_LAST_DAY_SHARE, MIN_PROJECTION_DAYS,
+    REQUIRED_COLUMNS, TEXT_COLUMNS,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def validate_data(df: Optional[pd.DataFrame]) -> bool:
@@ -42,13 +47,28 @@ def validate_data(df: Optional[pd.DataFrame]) -> bool:
 
 
 def numeric_codes(series: pd.Series) -> pd.Series:
-    """Parse a column of numeric codes to ints, with 0 for anything invalid."""
-    return pd.to_numeric(series, errors='coerce').fillna(0).astype(int)
+    """Parse a column of numeric codes to ints, with 0 for anything invalid.
+
+    Invalid is anything that is not a whole number: text, missing values,
+    fractions (3.7 is not precinct 3) and infinities.
+    """
+    codes = pd.to_numeric(series, errors='coerce')
+    # Beyond 2**53 a float no longer holds a whole number exactly
+    whole = ((codes % 1 == 0) & (codes.abs() < 2**53)).fillna(False)
+    return codes.where(whole, 0).astype(int)
 
 
 def code_labels(codes: Iterable[int], prefix: str = "") -> list[str]:
     """Labels for numeric codes: 3 becomes "Precinct 3", or "3" with no prefix."""
     return [f"{prefix} {code}" if prefix else str(code) for code in codes]
+
+
+def day_labels(days: Iterable[Any]) -> list[str]:
+    """Names for the feed's ISO day numbers: 1 becomes "Monday", 7 "Sunday".
+
+    Anything else is shown as it is, so an unexpected value stays visible.
+    """
+    return [DAY_LABELS[int(day) - 1] if day in range(1, 8) else str(day) for day in days]
 
 
 def format_categorical_series(series: pd.Series, prefix: str = "") -> pd.Series:
@@ -125,6 +145,10 @@ def safe_load_data_from_url(url: str, timeout: int = 300, max_retries: int = 5,
     The download is spooled to a temporary file and parsed from there, so the
     only large object held in memory is the resulting DataFrame.
 
+    This runs on the dataset cache's own thread, not a session's, so it makes
+    no Streamlit calls: retries go to the log, and the page that is waiting
+    shows its own spinner.
+
     Args:
         url: URL to fetch data from
         timeout: Read timeout in seconds
@@ -146,42 +170,68 @@ def safe_load_data_from_url(url: str, timeout: int = 300, max_retries: int = 5,
     wanted = set(usecols) if usecols is not None else None
     column_filter = (lambda name: name in wanted) if wanted is not None else None
 
-    status_placeholder = st.empty()
     attempt = 0
     while True:
         attempt += 1
         try:
             with tempfile.TemporaryFile() as buffer:
-                with st.spinner(f"Downloading Detroit crime data (attempt {attempt}/{max_retries})..."):
-                    with requests.get(url, timeout=(15, timeout), stream=True) as response:
-                        response.raise_for_status()
-                        # e.g. 202 while the portal is still building the export
-                        if response.status_code != 200:
-                            raise DataNotReadyError(
-                                f"the portal answered with status {response.status_code} instead of the data"
-                            )
-                        checked = False
-                        for chunk in response.iter_content(chunk_size=1024 * 1024):
-                            if not chunk:
-                                continue
-                            if not checked:
-                                _require_csv(chunk, response.headers.get("Content-Type", ""))
-                                checked = True
-                            buffer.write(chunk)
+                with requests.get(url, timeout=(15, timeout), stream=True) as response:
+                    response.raise_for_status()
+                    # e.g. 202 while the portal is still building the export
+                    if response.status_code != 200:
+                        raise DataNotReadyError(
+                            f"the portal answered with status {response.status_code} instead of the data"
+                        )
+                    checked = False
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        if not checked:
+                            _require_csv(chunk, response.headers.get("Content-Type", ""))
+                            checked = True
+                        buffer.write(chunk)
 
                 buffer.seek(0)
-                df = pd.read_csv(buffer, encoding="utf-8-sig", usecols=column_filter, low_memory=False)
-
-            status_placeholder.empty()
-            return df
+                # A stray byte that is not UTF-8 costs one character, not the dataset
+                return pd.read_csv(
+                    buffer, encoding="utf-8-sig", encoding_errors="replace",
+                    usecols=column_filter, low_memory=False,
+                )
 
         except Exception as e:
             if attempt >= max_retries or not is_transient_error(e):
-                status_placeholder.empty()
                 raise
             wait = 2 ** attempt
-            status_placeholder.warning(f"Download interrupted, retrying in {wait}s... ({e})")
+            logger.warning(
+                "Download attempt %d of %d failed, trying again in %ds: %s", attempt, max_retries, wait, e
+            )
             time.sleep(wait)
+
+
+def _release_frames(error: BaseException) -> None:
+    """Drop the tracebacks held by an exception and by the ones it was raised from.
+
+    A kept exception otherwise keeps every frame of the failed call alive, and
+    with them whatever they were holding: here, a half-loaded dataset.
+    """
+    pending, seen = [error], set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        traceback.clear_frames(current.__traceback__)
+        current.__traceback__ = None
+        pending += [current.__cause__, current.__context__]
+
+
+class _Load:
+    """One run of a loader: how it ended, and an event for those waiting on it."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.value: Any = None
+        self.error: Optional[BaseException] = None
 
 
 class RefreshingCache:
@@ -191,58 +241,99 @@ class RefreshingCache:
     it expires: it stays in use until a refresh succeeds. If a refresh fails,
     callers get the old value together with the error, and the load is not
     tried again until `retry_interval` has passed.
+
+    Loads run one at a time on a thread of the cache's own, and callers wait
+    for the result. So a load always runs to the end and is kept, even when
+    the caller that started it is interrupted (Streamlit stops a session's
+    script as soon as its user clicks something), and callers that arrive
+    during a load share it rather than start their own.
+
+    Args:
+        ttl: Age at which the value is due for a refresh
+        retry_interval: How long a failed refresh is left alone
+        first_retry_interval: The same for a failed first load, which leaves
+            nothing to show and so is usually tried again sooner. Defaults to
+            `retry_interval`.
+        clock: Source of the current time, in seconds
     """
 
     def __init__(self, ttl: float, retry_interval: float,
+                 first_retry_interval: Optional[float] = None,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self._ttl = ttl
         self._retry_interval = retry_interval
+        self._first_retry_interval = retry_interval if first_retry_interval is None else first_retry_interval
         self._clock = clock
+        # Guards the fields below. It is never held while a load runs.
         self._lock = threading.Lock()
         self._has_value = False
         self._value: Any = None
         self._loaded_at = 0.0
         self._failed_at: Optional[float] = None
-        self._error: Optional[Exception] = None
+        self._error: Optional[BaseException] = None
+        self._load: Optional[_Load] = None  # the load under way, if any
 
-    def get(self, loader: Callable[[], Any]) -> Tuple[Any, Optional[Exception]]:
+    def get(self, loader: Callable[[], Any]) -> Tuple[Any, Optional[BaseException]]:
         """Return (value, error), loading or refreshing with `loader` when due.
 
         `error` is None when the value is current. When a refresh has failed it
         is that failure, and the value is the previous one. With no previous
-        value to fall back on, a failed load raises.
+        value to fall back on, a failed load raises: for every caller that
+        waited for it, and for those that come after until it is due another
+        try.
         """
-        if self._has_value:
-            # Someone else is refreshing: use what there is rather than wait
-            if not self._lock.acquire(blocking=False):
-                return self._value, self._error
-        else:
-            self._lock.acquire()
+        with self._lock:
+            if self._has_value and self._clock() - self._loaded_at < self._ttl:
+                return self._value, None
 
-        try:
-            now = self._clock()
-            if self._has_value:
-                if now - self._loaded_at < self._ttl:
-                    return self._value, None
-                if self._failed_at is not None and now - self._failed_at < self._retry_interval:
+            load = self._load
+            if load is not None:
+                # A refresh is under way: use what there is rather than wait
+                if self._has_value:
                     return self._value, self._error
+            else:
+                retry_interval = self._retry_interval if self._has_value else self._first_retry_interval
+                if self._failed_at is not None and self._clock() - self._failed_at < retry_interval:
+                    if self._has_value:
+                        return self._value, self._error
+                    raise self._error.with_traceback(None)
+                load = _Load()
+                threading.Thread(
+                    target=self._run, args=(loader, load), name="refreshing-cache-load", daemon=True
+                ).start()
+                self._load = load
 
-            try:
-                value = loader()
-            except Exception as error:
-                if not self._has_value:
-                    raise
-                self._failed_at, self._error = now, error
-                return self._value, error
+        load.done.wait()
+        if load.error is None:
+            return load.value, None
+        with self._lock:
+            if self._has_value:
+                return self._value, load.error
+        # A kept exception is raised again and again; start its traceback afresh
+        raise load.error.with_traceback(None)
 
-            self._value, self._has_value = value, True
-            self._loaded_at, self._failed_at, self._error = now, None, None
-            return value, None
-        finally:
-            self._lock.release()
+    def _run(self, loader: Callable[[], Any], load: _Load) -> None:
+        """Run one load on the cache's thread and record how it ended."""
+        try:
+            load.value = loader()
+        except BaseException as error:  # whatever stops the load is its outcome
+            _release_frames(error)
+            load.error = error
+
+        with self._lock:
+            # Timed from the end of the attempt: a failure that was slow to
+            # show itself still earns the full wait before the next try
+            now = self._clock()
+            if load.error is None:
+                self._value, self._has_value = load.value, True
+                self._loaded_at, self._failed_at, self._error = now, None, None
+            else:
+                self._failed_at, self._error = now, load.error
+            self._load = None
+        load.done.set()
 
     def expire(self) -> None:
-        """Make the next `get` refresh the value, whatever its age."""
+        """Make the next `get` load again, whatever the age of the value or of a failure."""
         with self._lock:
             self._loaded_at = self._clock() - self._ttl
             self._failed_at = None
@@ -255,7 +346,11 @@ def dataset_cache() -> RefreshingCache:
     The DataFrame it holds is shared too. Treat it as read-only: filter or
     copy it before changing anything.
     """
-    return RefreshingCache(ttl=DATA_CACHE_TTL, retry_interval=DATA_RETRY_INTERVAL)
+    return RefreshingCache(
+        ttl=DATA_CACHE_TTL,
+        retry_interval=DATA_RETRY_INTERVAL,
+        first_retry_interval=DATA_FIRST_LOAD_RETRY_INTERVAL,
+    )
 
 
 # ── Cleaning ─────────────────────────────────────────────────────────────────
@@ -316,8 +411,13 @@ def clean_and_filter_data(df: pd.DataFrame, min_date: str,
     Returns:
         Cleaned DataFrame
     """
-    # Clean and prepare data
-    df = df.dropna(subset=['latitude', 'longitude'])
+    # One non-numeric cell makes read_csv hand over a whole coordinate column
+    # as text. Read the coordinates as numbers, so that cell is dropped below
+    # like a missing one instead of failing the comparisons further down.
+    df = df.assign(
+        latitude=pd.to_numeric(df['latitude'], errors='coerce'),
+        longitude=pd.to_numeric(df['longitude'], errors='coerce'),
+    ).dropna(subset=['latitude', 'longitude'])
 
     occurred = parse_feed_timestamps(df['incident_occurred_at'])
     df['incident_occurred_at'] = occurred.dt.tz_convert(local_timezone).dt.tz_localize(None)
@@ -333,14 +433,22 @@ def clean_and_filter_data(df: pd.DataFrame, min_date: str,
     df['date'] = df['incident_occurred_at'].dt.date
     df['incident_year'] = df['incident_occurred_at'].dt.year
 
-    # Trim padding so the same value is not counted under two spellings
+    # Trim padding so the same value is not counted under two spellings. A
+    # value that was only padding is missing, like an empty field in the CSV.
     for column in TEXT_COLUMNS:
         if column in df.columns and pd.api.types.is_string_dtype(df[column].dtype):
-            df[column] = df[column].str.strip()
+            stripped = df[column].str.strip()
+            df[column] = stripped.mask(stripped == "")
 
-    # Find the most recent date and exclude it (incomplete data)
-    most_recent_date = df['date'].max()
-    df = df[df['date'] < most_recent_date]
+    # The feed's last day is still being filled in, so it is left out, along
+    # with anything dated after it. A stray row with a later date (a typo) must
+    # not pass for that day, or the real one would be kept as if complete: the
+    # last day is the latest one with a fair share of a typical day's incidents.
+    # A real last day with fewer than that costs one complete day as well.
+    per_day = df['date'].value_counts()
+    if not per_day.empty:
+        full_enough = per_day[per_day >= per_day.median() * MIN_LAST_DAY_SHARE]
+        df = df[df['date'] < full_enough.index.max()]
 
     # Filter out records with invalid coordinates
     df = df[(df['latitude'] != 0) & (df['longitude'] != 0)]

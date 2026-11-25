@@ -33,11 +33,19 @@ MAX_SCATTER_POINTS = 250_000
 # bad rows are dropped; more than this means the feed itself has changed.
 MAX_UNPARSEABLE_DATE_SHARE = 0.01
 
+# The feed's last day is the latest one with at least this share of a typical
+# (median) day's incidents. That day and anything after it is left out as
+# incomplete; a lone mistyped row dated later does not count as a day.
+MIN_LAST_DAY_SHARE = 0.1
+
 # Cache settings (in seconds)
 DATA_CACHE_TTL = 86400  # 24 hours
 # After a failed refresh the previous data stays in use; wait this long before
 # trying the download again.
 DATA_RETRY_INTERVAL = 900  # 15 minutes
+# A failed first load leaves nothing to show, so it is tried again sooner.
+# Until then every visitor is shown the failure rather than repeating the download.
+DATA_FIRST_LOAD_RETRY_INTERVAL = 60  # 1 minute
 FORECAST_CACHE_TTL = 3600  # 1 hour
 YOY_CACHE_TTL = 1800  # 30 minutes
 
@@ -47,7 +55,6 @@ REQUIRED_COLUMNS = [
     'latitude',
     'longitude',
     'incident_occurred_at',
-    'incident_entry_id',
     'offense_category',
     'offense_description',
     'case_status',

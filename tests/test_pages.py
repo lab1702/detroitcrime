@@ -106,6 +106,23 @@ def test_year_filter_only_offers_years_in_the_data(overview, clean_df):
     assert (date_range.value, date_range.delta) == ("365 days", "2025-01-01 to 2025-12-31")
 
 
+def test_current_year_keeps_its_change_from_last_year(overview):
+    for_every_year = {m.label: m.delta for m in overview.metric}
+    assert for_every_year["Avg Daily"].endswith("%")
+
+    # The Year filter leaves only 2026 in the selection, but not in the comparison
+    overview.sidebar.selectbox[1].select(2026).run()
+    assert not overview.exception
+    this_year = {m.label: m.delta for m in overview.metric}
+    assert this_year["Total Incidents"] == for_every_year["Total Incidents"]
+    assert this_year["Avg Daily"] == for_every_year["Avg Daily"]
+
+    # A past year is not what the comparison is about, so none is claimed for it
+    overview.sidebar.selectbox[1].select(2025).run()
+    past_year = {m.label: m.delta for m in overview.metric}
+    assert not past_year["Total Incidents"] and not past_year["Avg Daily"]
+
+
 def test_top_descriptions_are_not_split_by_padding(overview):
     overview.sidebar.selectbox[0].select("CATEGORY 01").run()
     assert not overview.exception
@@ -156,6 +173,25 @@ def test_first_load_failure_is_reported(monkeypatch):
     assert not at.metric
 
 
+def test_failed_first_load_is_not_repeated_by_the_next_rerun(monkeypatch):
+    downloads = []
+
+    def portal_down_counted(url, **kwargs):
+        downloads.append(url)
+        raise requests.exceptions.ConnectionError("portal down")
+
+    monkeypatch.setattr(utils, "safe_load_data_from_url", portal_down_counted)
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
+    at.run()
+    at.run()
+
+    # The second run reports the same failure without downloading again
+    assert len(downloads) == 1
+    assert [e.value for e in at.error] == [
+        "Connection failed. Please check your internet connection and try again."
+    ]
+
+
 def test_failed_refresh_keeps_showing_the_last_data(overview, monkeypatch):
     # The data is due for a refresh, and the portal is down
     monkeypatch.setattr(utils, "safe_load_data_from_url", portal_down)
@@ -181,8 +217,10 @@ def test_feed_with_no_usable_rows_is_an_error_and_is_not_kept(raw_feed, monkeypa
     ]
     assert not at.metric
 
-    # Nothing was cached: once the feed is right again, the next run loads it
+    # Nothing was cached: once the feed is right again, and the wait before
+    # another try is over, the next run loads it
     monkeypatch.setattr(utils, "safe_load_data_from_url", lambda url, **kwargs: raw_feed.copy())
+    utils.dataset_cache().expire()
     at.run()
     assert not at.error
     assert at.metric
@@ -333,12 +371,31 @@ def test_pivot_sorts_codes_as_numbers(page_state):
     assert figure["layout"]["xaxis"]["type"] == "category"
 
 
-def test_pivot_counts_every_incident(page_state, clean_df):
-    # Rows are counted, so an incident without an entry id is still included
-    no_ids = dict(page_state, df_filtered=clean_df.assign(incident_entry_id=None))
-    at = run_page("4_Analysis.py", no_ids)
-    assert not at.error
+def test_pivot_says_how_many_incidents_it_cannot_place(page_state, clean_df):
+    # Every incident has a category and a status: all are counted, nothing to add
+    at = run_page("4_Analysis.py", page_state)
     assert int(at.dataframe[0].value.to_numpy().sum()) == len(clean_df)
+    assert not at.caption
+
+    # Seven incidents without a case status have no column to be counted in
+    no_status = clean_df.index.isin(clean_df.index[:7])
+    some_missing = clean_df.assign(case_status=clean_df["case_status"].mask(no_status))
+    at = run_page("4_Analysis.py", dict(page_state, df_filtered=some_missing))
+    assert not at.error
+    assert int(at.dataframe[0].value.to_numpy().sum()) == len(clean_df) - 7
+    assert [c.value for c in at.caption] == [
+        f"7 of {len(clean_df):,} incidents have no offense_category or case_status and are not in the table."
+    ]
+
+
+def test_pivot_names_the_days_of_the_week(page_state):
+    at = run_page("4_Analysis.py", page_state)
+    at.selectbox(key="pivot_rows").select("incident_day_of_week").run()
+    assert not at.exception and not at.error
+
+    # Monday to Sunday, in that order, instead of a bare 1 to 7
+    assert at.dataframe[0].value.index.tolist() == DAY_LABELS
+    assert plotly_figures(at)[0]["layout"]["yaxis"]["type"] == "category"
 
 
 def test_pivot_year_axis_ticks_on_whole_years(clean_df):

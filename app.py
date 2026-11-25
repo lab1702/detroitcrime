@@ -38,6 +38,7 @@ def fetch_data() -> pd.DataFrame:
 
     Called through `dataset_cache()`, which keeps the result for every session
     and rerun to share, and keeps the previous result when a refresh fails.
+    It runs on the cache's thread, not a session's: no Streamlit calls here.
     """
     df = safe_load_data_from_url(DATA_URL, usecols=REQUIRED_COLUMNS)
     validate_data(df)
@@ -93,6 +94,7 @@ def overview_page() -> None:
     """Render the Overview page content."""
     df_filtered = st.session_state.get("df_filtered")
     selected_category = st.session_state.get("selected_category", "All")
+    selected_year = st.session_state.get("selected_year", "All")
     data_end_date = st.session_state.get("data_end_date")
 
     st.header("Overview")
@@ -110,7 +112,12 @@ def overview_page() -> None:
     total_days = (period_end - period_start).days + 1
     avg_daily = len(df_filtered) / total_days if total_days > 0 else 0
 
-    incidents_delta, avg_delta = compute_yoy_deltas(df_filtered, data_end_date)
+    # The change from last year compares the current year with the one before,
+    # so it needs both: the Year filter is left out of it. It is shown for
+    # every year together and for the current year, not for a past year.
+    incidents_delta, avg_delta = None, None
+    if selected_year in ("All", data_end_date.year):
+        incidents_delta, avg_delta = compute_yoy_deltas(st.session_state["df_all_years"], data_end_date)
 
     # More crime is bad news, so increases are shown in red (inverse colors).
     with col1:
@@ -196,9 +203,12 @@ def main() -> None:
     ])
 
     # The dataset is refreshed once it is DATA_CACHE_TTL old. If that refresh
-    # fails, the previous copy stays in use and the failure is reported.
+    # fails, the previous copy stays in use and the failure is reported. The
+    # download runs on the cache's own thread and this only waits for it, so a
+    # click that interrupts this script does not throw the download away.
     try:
-        df, refresh_error = dataset_cache().get(fetch_data)
+        with st.spinner("Downloading Detroit crime data..."):
+            df, refresh_error = dataset_cache().get(fetch_data)
     except Exception as e:
         st.error(load_error_message(e))
         return

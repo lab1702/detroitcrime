@@ -1,6 +1,8 @@
 """Data loading, cleaning and year-over-year maths."""
 
+import gc
 import threading
+import weakref
 from datetime import date
 
 import pandas as pd
@@ -13,7 +15,7 @@ from constants import REQUIRED_COLUMNS
 from theme import BLUE_ACCENT, RED_ACCENT, apply_dark_plotly
 from utils import (
     DataNotReadyError, RefreshingCache, clean_and_filter_data, code_labels, compute_yoy_deltas,
-    daily_incident_counts, format_categorical_series, numeric_codes, project_full_year,
+    daily_incident_counts, day_labels, format_categorical_series, numeric_codes, project_full_year,
     safe_load_data_from_url, selection_period,
 )
 
@@ -75,6 +77,17 @@ class TestLocalTime:
         df = clean(feed_rows(["2024/03/01 15:00:00+00", "2024/03/02 15:00:00+00"]))
         assert df["date"].tolist() == [date(2024, 3, 1)]
 
+    def test_stray_late_row_is_not_taken_for_the_last_day(self):
+        # 20 incidents a day, and 6 so far on 4 Mar, the feed's real last day.
+        # One row mistyped as 9 Mar must not pass for the last day in its place.
+        def day(number: int, incidents: int) -> list[str]:
+            return [f"2024/03/{number:02d} 15:{minute:02d}:00+00" for minute in range(incidents)]
+
+        df = clean(feed_rows(day(1, 20) + day(2, 20) + day(3, 20) + day(4, 6) + day(9, 1)))
+        assert df["date"].value_counts().to_dict() == {
+            date(2024, 3, 1): 20, date(2024, 3, 2): 20, date(2024, 3, 3): 20,
+        }
+
     def test_year_matches_the_feed_for_synthetic_data(self, clean_df):
         assert (clean_df["incident_year"] == clean_df["incident_occurred_at"].dt.year).all()
         assert clean_df["incident_occurred_at"].dt.tz is None
@@ -123,7 +136,25 @@ class TestBadDates:
         assert len(df) == 1
 
 
+class TestBadCoordinates:
+    def test_non_numeric_coordinate_is_dropped_without_failing_the_load(self):
+        # One bad cell makes read_csv hand over the whole column as text
+        df = clean(feed_rows(
+            ["2024/03/01 15:00:00+00", "2024/03/01 16:00:00+00", "2024/03/01 17:00:00+00", LATER],
+            latitude=["42.33", "N/A", "42.35", "42.33"],
+        ))
+        assert df["latitude"].tolist() == [42.33, 42.35]
+
+
 class TestTextCleanup:
+    def test_padding_only_is_a_missing_value(self):
+        df = clean(feed_rows(
+            ["2024/03/01 15:00:00+00", "2024/03/01 16:00:00+00", LATER],
+            neighborhood=["      ", "Nolan  ", "x"],
+        ))
+        assert df["neighborhood"].isna().tolist() == [True, False]
+        assert df["neighborhood"].value_counts().to_dict() == {"Nolan": 1}
+
     def test_padded_descriptions_are_one_value(self):
         df = clean(feed_rows(
             ["2024/03/01 15:00:00+00", "2024/03/01 16:00:00+00", LATER],
@@ -199,9 +230,19 @@ class TestCategoricalFormatting:
     def test_codes_are_numbers_with_zero_for_anything_invalid(self):
         assert numeric_codes(pd.Series([3.0, "07", None, "n/a", 0, "48201-1234"])).tolist() == [3, 7, 0, 0, 0, 0]
 
+    def test_only_whole_finite_numbers_are_codes(self):
+        # An infinity used to fail the whole column; 3.7 was counted as code 3
+        codes = pd.Series(["inf", "1e400", 3.7, "4.0", 1e300])
+        assert numeric_codes(codes).tolist() == [0, 0, 0, 4, 0]
+        assert numeric_codes(pd.Series([2, 12])).tolist() == [2, 12]
+
     def test_labels_keep_the_order_of_the_codes(self):
         assert code_labels([2, 9, 10], "Precinct") == ["Precinct 2", "Precinct 9", "Precinct 10"]
         assert code_labels([48201, 48226]) == ["48201", "48226"]
+
+    def test_days_are_named_iso_style(self):
+        assert day_labels([1, 2.0, 7]) == ["Monday", "Tuesday", "Sunday"]
+        assert day_labels([0, 8]) == ["0", "8"]
 
 
 CSV_BODY = b"latitude,offense_category\n42.3,ARSON\n42.4,FRAUD\n"
@@ -318,6 +359,23 @@ class TestDownload:
         with pytest.raises(ValueError, match="max_retries"):
             safe_load_data_from_url(URL, max_retries=0)
 
+    def test_stray_invalid_byte_costs_one_character_not_the_load(self, portal):
+        portal.append(FakeResponse(b"latitude,nearest_intersection\n42.3,Caf\xe9 Ave\n"))
+        df = safe_load_data_from_url(URL)
+        assert df["nearest_intersection"].tolist() == ["Caf� Ave"]
+
+    def test_makes_no_streamlit_calls(self, portal, monkeypatch):
+        # It runs on the cache's thread, which has no page to draw on. On a
+        # session's thread a Streamlit call is where a click interrupts the
+        # script, which used to throw a finished download away.
+        class NoStreamlit:
+            def __getattr__(self, name):
+                raise AssertionError(f"st.{name} was used during the download")
+
+        monkeypatch.setattr(utils, "st", NoStreamlit())
+        portal.extend([FakeResponse(status=503), FakeResponse()])
+        assert len(safe_load_data_from_url(URL)) == 2
+
 
 class Clock:
     """A clock the test moves by hand."""
@@ -349,7 +407,7 @@ class TestRefreshingCache:
 
     @pytest.fixture
     def cache(self, clock) -> RefreshingCache:
-        return RefreshingCache(ttl=100, retry_interval=10, clock=clock)
+        return RefreshingCache(ttl=100, retry_interval=10, first_retry_interval=3, clock=clock)
 
     def test_value_is_reused_until_it_is_due(self, cache, clock):
         load = loader("first", "second")
@@ -372,11 +430,111 @@ class TestRefreshingCache:
         clock.now += 1
         assert cache.get(load) == ("second", None)
 
-    def test_first_load_failure_is_raised_and_nothing_is_kept(self, cache):
+    def test_first_load_failure_is_raised_and_nothing_is_kept(self, cache, clock):
         load = loader(RuntimeError("portal down"), "first")
         with pytest.raises(RuntimeError, match="portal down"):
             cache.get(load)
+        # The next caller is told of the same failure; the load is not run again for it...
+        clock.now += 2
+        with pytest.raises(RuntimeError, match="portal down"):
+            cache.get(load)
+        # ...until the wait before another first load is over
+        clock.now += 1
         assert cache.get(load) == ("first", None)
+
+    def test_callers_waiting_for_the_first_load_share_it(self, cache):
+        started, finish = threading.Event(), threading.Event()
+        loads = []
+
+        def slow_load():
+            loads.append("load")
+            started.set()
+            finish.wait(timeout=5)
+            return "first"
+
+        seen = []
+        sessions = [threading.Thread(target=lambda: seen.append(cache.get(slow_load))) for _ in range(4)]
+        for session in sessions:
+            session.start()
+        started.wait(timeout=5)
+        finish.set()
+        for session in sessions:
+            session.join(timeout=5)
+
+        assert loads == ["load"]
+        assert seen == [("first", None)] * 4
+
+    def test_failed_first_load_fails_once_for_everyone_waiting(self, cache):
+        started, finish = threading.Event(), threading.Event()
+        loads = []
+
+        def slow_failure():
+            loads.append("load")
+            started.set()
+            finish.wait(timeout=5)
+            raise RuntimeError("portal down")
+
+        seen = []
+
+        def session():
+            try:
+                cache.get(slow_failure)
+            except RuntimeError as error:
+                seen.append(str(error))
+
+        sessions = [threading.Thread(target=session) for _ in range(4)]
+        for thread in sessions:
+            thread.start()
+        started.wait(timeout=5)
+        finish.set()
+        for thread in sessions:
+            thread.join(timeout=5)
+
+        assert loads == ["load"]
+        assert seen == ["portal down"] * 4
+
+    def test_load_does_not_run_on_the_thread_that_asked_for_it(self, cache):
+        # A session's script can be interrupted while it waits (its user clicked
+        # something). The load is not on that thread, so it finishes and is kept.
+        ran_on = []
+        assert cache.get(lambda: ran_on.append(threading.current_thread()) or "first") == ("first", None)
+        assert ran_on[0] is not threading.current_thread()
+
+    def test_retry_interval_starts_when_the_failed_attempt_ends(self, cache, clock):
+        cache.get(loader("first"))
+        clock.now += 100
+
+        def slow_failure():
+            clock.now += 60  # the attempt alone outlasts the retry interval
+            raise RuntimeError("portal down")
+
+        value, error = cache.get(slow_failure)
+        assert (value, str(error)) == ("first", "portal down")
+        # Straight afterwards the portal is left alone (this loader would fail if run)
+        assert cache.get(loader()) == ("first", error)
+        clock.now += 10
+        assert cache.get(loader("second")) == ("second", None)
+
+    def test_kept_failure_does_not_keep_the_failed_load_in_memory(self, cache):
+        class Download:
+            """Stands in for the dataset a failed load was holding."""
+
+        downloads = []
+
+        def failing_load():
+            download = Download()
+            downloads.append(weakref.ref(download))
+            try:
+                raise KeyError("zip_code")
+            except KeyError:
+                raise ValueError("the feed changed")  # the KeyError is kept as its context
+
+        cache.get(loader("first"))
+        cache.expire()
+        value, error = cache.get(failing_load)
+        gc.collect()
+        assert (value, str(error)) == ("first", "the feed changed")
+        assert downloads[0]() is None
 
     def test_other_callers_get_the_old_value_while_a_refresh_runs(self, cache, clock):
         cache.get(loader("first"))
