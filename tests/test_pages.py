@@ -4,7 +4,7 @@ import base64
 import json
 import threading
 import warnings
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +14,7 @@ import requests
 import streamlit as st
 from streamlit.proto.Metric_pb2 import Metric as MetricProto
 from streamlit.testing.v1 import AppTest
+from urllib3.exceptions import ReadTimeoutError
 
 import utils
 from conftest import clean_feed, make_page_state, make_raw_feed
@@ -25,6 +26,8 @@ TIMEOUT = 300  # the Trends page fits a Prophet model
 # What a page says while it waits for a download to end
 REFRESHING_NOTE = "Newer data is being downloaded. This page will update when it is ready."
 RETRY_NOTE = "The download will be tried again shortly, and this page will update by itself."
+# The same after a failure that would only repeat, which the cache is slower to try again
+LATER_NOTE = "The download will be tried again later, and this page will update by itself."
 
 
 def run_page(name: str, state: dict) -> AppTest:
@@ -117,6 +120,38 @@ def test_first_visit_on_a_page_url_goes_through_the_app(raw_feed, monkeypatch):
     assert not at.warning
     assert [s.label for s in at.sidebar.selectbox] == ["Offense Category", "Year"]
     assert len(plotly_figures(at)) == 4
+
+
+def test_pivot_page_is_handed_the_selection_by_the_app(raw_feed, clean_df, monkeypatch):
+    # The other page tests hand a page its session state themselves. Here it
+    # is app.py that does, so the two cannot come to disagree unnoticed.
+    at = run_app(raw_feed, monkeypatch)
+    at.sidebar.selectbox[1].select(2025).run()
+    at.switch_page("views/4_Analysis.py").run()
+
+    assert not at.exception, at.exception
+    assert not at.error and not at.warning
+    in_2025 = int((clean_df["incident_year"] == 2025).sum())
+    assert int(at.dataframe[0].value.to_numpy().sum()) == in_2025
+
+
+def test_map_page_is_handed_the_category_ranking_by_the_app(raw_feed, clean_df, monkeypatch):
+    at = run_app(raw_feed, monkeypatch)
+    at.switch_page("views/5_Map.py").run()
+    assert not at.exception, at.exception
+    assert not at.warning
+    assert len(deck_spec(at)["layers"][0]["data"]) == len(clean_df)
+    everything = legend_colors(at)
+    assert "Other (5 categories)" in everything
+
+    # Filtered to the fourth most frequent category, it keeps the color it has
+    # in the full view. Without the ranking of the whole dataset from app.py
+    # the page ranks the selection, and this one would turn the first color.
+    category = clean_df["offense_category"].value_counts().index[3]
+    at.sidebar.selectbox[0].select(category).run()
+    assert not at.exception, at.exception
+    assert "Map" in [h.value for h in at.header]
+    assert legend_colors(at) == {category: everything[category]}
 
 
 # ── Overview (through app.py, with the download replaced) ────────────────────
@@ -344,8 +379,10 @@ def test_dataset_that_has_moved_is_not_reported_as_a_passing_fault(monkeypatch):
         "https://example.invalid/feed.csv. It may have been moved or withdrawn, in which case "
         "the address the app downloads from needs updating."
     ]
-    # It would say the same on every try, so the page does not go on asking
-    assert not at.caption
+    # It would say the same on every try, so nothing is promised "shortly".
+    # The page still looks again, as seldom as the cache tries: a portal that
+    # is republishing the dataset answers like this for a while.
+    assert [c.value for c in at.caption] == [LATER_NOTE]
 
 
 def test_server_fault_is_reported_as_one_that_may_pass(monkeypatch):
@@ -399,6 +436,19 @@ def test_failure_is_not_put_to_the_visitor_to_fix(monkeypatch):
         raise requests.exceptions.ReadTimeout("read timed out")
 
     monkeypatch.setattr(utils, "safe_load_data_from_url", timed_out)
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
+    at.run()
+    assert [e.value for e in at.error] == ["The data portal took too long to answer."]
+    assert [c.value for c in at.caption] == [RETRY_NOTE]
+
+
+def test_portal_that_goes_silent_mid_download_is_not_reported_as_unreachable(monkeypatch):
+    # `requests` does not call this one a timeout: it wraps urllib3's error in
+    # a ConnectionError, which used to read "could not reach the data portal"
+    def stalled(url, **kwargs):
+        raise requests.exceptions.ConnectionError(ReadTimeoutError(None, url, "Read timed out."))
+
+    monkeypatch.setattr(utils, "safe_load_data_from_url", stalled)
     at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
     at.run()
     assert [e.value for e in at.error] == ["The data portal took too long to answer."]
@@ -565,19 +615,31 @@ def test_page_left_open_stays_as_it_is_while_the_cache_is_at_rest(clean_df, monk
     assert at.metric
 
 
+class FailedOnce(RestingCache):
+    """Stands in for the dataset cache after a first load that failed with `cause`.
+
+    The first run that asks is told of the failure, at version 7; the next is
+    given the data.
+    """
+
+    def __init__(self, df: pd.DataFrame, at_rest_answers: list[bool], cause: Exception):
+        super().__init__(df, at_rest_answers)
+        self.cause = cause
+
+    def get_versioned(self, loader):
+        if self.gets == 0:
+            self.gets += 1
+            raise utils.LoadFailedError(str(self.cause), version=7) from self.cause
+        return super().get_versioned(loader)
+
+
 def test_failed_first_load_is_tried_again_when_the_cache_says_it_is_due(clean_df, monkeypatch):
     # The page arrives late in the cache's wait. It goes back for the data
     # when the cache is due another try, not a whole wait after it was opened.
-    class FailedOnce(RestingCache):
-        def get_versioned(self, loader):
-            if self.gets == 0:
-                self.gets += 1
-                error = utils.LoadFailedError("portal down", version=7)
-                raise error from requests.exceptions.ConnectionError("portal down")
-            return super().get_versioned(loader)
+    portal_is_down = requests.exceptions.ConnectionError("portal down")
 
     # At rest when the page is drawn...
-    cache = FailedOnce(clean_df, at_rest_answers=[True])
+    cache = FailedOnce(clean_df, at_rest_answers=[True], cause=portal_is_down)
     monkeypatch.setattr(utils, "dataset_cache", lambda: cache)
     at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
     at.run()
@@ -586,7 +648,38 @@ def test_failed_first_load_is_tried_again_when_the_cache_says_it_is_due(clean_df
     assert (cache.gets, cache.asked_about) == (1, [7])
 
     # ...and due another try by the time a page asks again
-    cache = FailedOnce(clean_df, at_rest_answers=[False])
+    cache = FailedOnce(clean_df, at_rest_answers=[False], cause=portal_is_down)
+    monkeypatch.setattr(utils, "dataset_cache", lambda: cache)
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
+    at.run()
+    assert not at.exception, at.exception
+    assert cache.gets == 2
+    assert not at.error and not at.caption
+    assert at.metric
+
+
+def test_open_page_goes_back_for_the_data_after_a_failure_that_looked_set_to_repeat(clean_df, monkeypatch):
+    # An export caught half written cannot be parsed, and the same file never
+    # will be; the next export is whole. A page left open used to stay on the
+    # failure until someone reloaded it.
+    half_written = pd.errors.ParserError("Error tokenizing data. C error: EOF inside string starting at row 5")
+    assert not utils.is_transient_error(half_written)
+
+    # At rest when the page is drawn: it says it will look again, though not shortly...
+    cache = FailedOnce(clean_df, at_rest_answers=[True], cause=half_written)
+    monkeypatch.setattr(utils, "dataset_cache", lambda: cache)
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
+    at.run()
+    assert [e.value for e in at.error] == [
+        "Data validation error: Error tokenizing data. C error: EOF inside string starting at row 5"
+    ]
+    assert [c.value for c in at.caption] == [LATER_NOTE]
+    assert not at.metric
+    # It asks about the failure it was told of, and no sooner goes back for the data
+    assert (cache.gets, cache.asked_about) == (1, [7])
+
+    # ...and goes back once the cache is due another try
+    cache = FailedOnce(clean_df, at_rest_answers=[False], cause=half_written)
     monkeypatch.setattr(utils, "dataset_cache", lambda: cache)
     at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
     at.run()
@@ -618,6 +711,9 @@ def test_refresh_that_has_lost_most_of_its_incidents_is_refused(overview, raw_fe
         "Data validation error: the refreshed feed has only "
     )
     assert f"against {before['Total Incidents']} in the copy shown" in warning
+    # What to do about it is for whoever runs the app, and goes to the log:
+    # the page asks nothing of a visitor
+    assert "restart" not in warning
 
 
 def test_filters_are_kept_when_a_refresh_changes_their_options(raw_feed, monkeypatch):
@@ -681,8 +777,8 @@ def test_feed_with_no_usable_rows_is_an_error_and_is_not_kept(raw_feed, monkeypa
     ]
     assert not at.metric
     # The same feed would fail the same way, at the cost of a whole download
-    # each time: the page does not try again by itself
-    assert not at.caption
+    # each time: the page tries again no sooner than the cache will
+    assert [c.value for c in at.caption] == [LATER_NOTE]
 
     # Nothing was cached: once the feed is right again, and the wait before
     # another try is over, the next run loads it
@@ -768,6 +864,20 @@ def test_forecast_names_each_holiday_once_and_in_full(page_state):
         "Memorial Day", "Juneteenth", "Independence Day", "Labor Day", "Columbus Day", "Veterans Day",
         "Thanksgiving Day", "Christmas Day", "New Year's Day", "MLK Day", "Presidents' Day",
     ]
+
+
+def test_holiday_on_the_last_day_of_data_is_not_marked_on_the_forecast():
+    # The feed's last day, 28 November 2025, is left out as incomplete, so the
+    # data ends on Thanksgiving Day: history, like Labor Day in the months
+    # shown before it, which has no mark either
+    df = clean_feed(make_raw_feed(end="2025-11-28 23:00"))
+    assert df["date"].max() == date(2025, 11, 27)
+
+    at = run_page("2_Trends.py", make_page_state(df))
+    notes = forecast_figure(at)["layout"]["annotations"]
+    # Only the Thanksgiving that is forecast, a year on
+    assert [note["text"] for note in notes].count("Thanksgiving Day") == 1
+    assert min(note["x"][:10] for note in notes) > "2025-11-27"
 
 
 def test_forecast_ignores_the_year_filter(clean_df):
@@ -882,7 +992,7 @@ def test_projection_counts_from_the_first_day_of_data():
     assert [c.value for c in at.caption] == ["Lighter bars cover part of a year: 2026 (1 Feb to 29 Jun)."]
 
 
-def test_forecast_failure_is_reported_and_not_cached(page_state, monkeypatch):
+def test_forecast_failure_is_reported_and_not_cached(page_state, monkeypatch, caplog):
     from prophet import Prophet
 
     def broken_fit(self, *args, **kwargs):
@@ -893,6 +1003,11 @@ def test_forecast_failure_is_reported_and_not_cached(page_state, monkeypatch):
         at = run_page("2_Trends.py", page_state)
         assert [e.value for e in at.error] == ["Error creating forecast: optimizer exploded"]
         assert not at.info  # not blamed on "not enough data"
+        # The page shows the message only: the log says where it went wrong
+        [record] = [r for r in caplog.records if r.name == "views.trends"]
+        assert record.levelname == "ERROR"
+        assert "RuntimeError: optimizer exploded" in caplog.text
+        assert "in broken_fit" in caplog.text
 
     # Next visit, with Prophet working again, gets a real forecast
     at = run_page("2_Trends.py", page_state)
@@ -919,6 +1034,21 @@ def test_swap_button_swaps_rows_and_columns(page_state):
 
     at.button(key="swap_pivot").click().run()
     assert at.selectbox(key="pivot_rows").value == "offense_category"
+
+
+def test_pivot_failure_is_reported_and_logged(page_state, monkeypatch, caplog):
+    def broken_pivot(*args, **kwargs):
+        raise RuntimeError("pivot exploded")
+
+    monkeypatch.setattr(pd, "pivot_table", broken_pivot)
+    at = run_page("4_Analysis.py", page_state)
+    assert [e.value for e in at.error] == ["Error creating pivot table: pivot exploded"]
+    assert not at.dataframe
+    # The page shows the message only: the log says where it went wrong
+    [record] = [r for r in caplog.records if r.name == "views.analysis"]
+    assert record.levelname == "ERROR"
+    assert "RuntimeError: pivot exploded" in caplog.text
+    assert "in broken_pivot" in caplog.text
 
 
 def test_pivot_selection_is_kept_for_the_next_visit(page_state):

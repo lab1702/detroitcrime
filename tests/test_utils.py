@@ -10,6 +10,7 @@ import pandas as pd
 import plotly.express as px
 import pytest
 import requests
+from urllib3.exceptions import ReadTimeoutError
 
 import utils
 from constants import REQUIRED_COLUMNS
@@ -504,6 +505,18 @@ def portal(monkeypatch):
 URL = "https://example.invalid/feed.csv"
 
 
+class SteppedTime:
+    """Stands in for the time module: a clock that moves only when told to."""
+
+    now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
 class TestDownload:
     def test_reads_only_wanted_columns_from_a_bom_csv(self, portal):
         body = "﻿X,latitude,offense_category,ESRI_OID\n1,42.3,ARSON,9\n2,42.4,FRAUD,8\n".encode("utf-8")
@@ -595,18 +608,7 @@ class TestDownload:
         # Each attempt waits a minute for a portal that says nothing. Five of
         # them at five minutes each kept the first visitors at a spinner for
         # 25 minutes before they were told anything.
-        class Time:
-            """Stands in for the time module: a clock that moves only when told to."""
-
-            now = 0.0
-
-            def monotonic(self) -> float:
-                return self.now
-
-            def sleep(self, seconds: float) -> None:
-                self.now += seconds
-
-        clock = Time()
+        clock = SteppedTime()
         attempts = []
 
         def stalled(*args, **kwargs):
@@ -620,6 +622,39 @@ class TestDownload:
             safe_load_data_from_url(URL, retry_budget=120)
         # Tried once more, 2 seconds after the first; by then the time is up
         assert attempts == [0, 62]
+
+    def test_no_attempt_is_started_once_the_retry_budget_is_spent(self, monkeypatch):
+        # Each attempt brings data in for 58 seconds before the line drops. The
+        # second ends 2 seconds inside the budget: after the wait that follows
+        # it a third would start outside it, and used to (at 122 seconds),
+        # with nothing to say how long that one would take.
+        clock = SteppedTime()
+        attempts = []
+
+        def cut_short(*args, **kwargs):
+            attempts.append(clock.now)
+            clock.now += 58
+            raise requests.exceptions.ChunkedEncodingError("connection broken: IncompleteRead")
+
+        monkeypatch.setattr(utils, "time", clock)
+        monkeypatch.setattr(utils.requests, "get", cut_short)
+        with pytest.raises(requests.exceptions.ChunkedEncodingError):
+            safe_load_data_from_url(URL, retry_budget=120)
+        assert attempts == [0, 60]
+
+    def test_silence_in_the_middle_of_a_download_is_a_timeout_too(self):
+        # `requests` does not call it one: it wraps urllib3's error in a
+        # ConnectionError (seen with a local server that stops mid-body)
+        stalled = requests.exceptions.ConnectionError(ReadTimeoutError(None, URL, "Read timed out."))
+        assert utils.is_timeout(stalled)
+        assert utils.is_transient_error(stalled)
+        # Silence before the first byte, and no answer to the connection at all
+        assert utils.is_timeout(requests.exceptions.ReadTimeout("read timed out"))
+        assert utils.is_timeout(requests.exceptions.ConnectTimeout("no answer"))
+        # A portal that could not be reached is not one that took too long
+        assert not utils.is_timeout(requests.exceptions.ConnectionError("connection refused"))
+        assert not utils.is_timeout(requests.exceptions.ConnectionError())
+        assert not utils.is_timeout(ValueError("the feed changed"))
 
     def test_silent_portal_is_waited_for_no_longer_than_the_read_timeout(self, monkeypatch):
         asked_with = {}
@@ -1149,6 +1184,20 @@ class TestShrunkenRefresh:
     def test_refresh_that_has_lost_much_of_its_rows_is_refused(self):
         with pytest.raises(ValueError, match="only 899 usable incidents, against 1,000 in the copy shown"):
             refuse_shrunken_refresh(self.rows(899), self.rows(1000))
+
+    def test_what_to_do_about_a_refused_refresh_is_for_the_log_not_the_page(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="utils"):
+            with pytest.raises(ValueError) as refused:
+                refuse_shrunken_refresh(self.rows(899), self.rows(1000))
+        # The message is shown to every visitor, who cannot restart anything
+        assert "restart" not in str(refused.value)
+        assert "against 1000 in the copy in use" in caplog.text
+        assert "restart the app to accept it" in caplog.text
+
+    def test_refresh_that_is_taken_is_not_logged(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="utils"):
+            refuse_shrunken_refresh(self.rows(900), self.rows(1000))
+        assert not caplog.records
 
     def test_dataset_cache_checks_its_refreshes(self):
         utils.st.cache_resource.clear()

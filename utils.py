@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+from urllib3.exceptions import ReadTimeoutError
 
 from constants import (
     CODE_LABEL_PREFIXES, DATA_CACHE_TTL, DATA_FIRST_LOAD_RETRY_INTERVAL, DATA_MAX_RETRY_INTERVAL,
@@ -161,6 +162,23 @@ def is_transient_error(error: Exception) -> bool:
     return isinstance(error, TRANSIENT_ERRORS + (DataNotReadyError,))
 
 
+def is_timeout(error: BaseException) -> bool:
+    """Whether a failed download is the portal taking too long to say anything.
+
+    `requests` reports a portal that is silent before its first byte as a
+    Timeout. One that goes silent in the middle of the download it reports as
+    a ConnectionError around urllib3's ReadTimeoutError, which would otherwise
+    be taken for a portal that could not be reached.
+    """
+    if isinstance(error, requests.exceptions.Timeout):
+        return True
+    return (
+        isinstance(error, requests.exceptions.ConnectionError)
+        and bool(error.args)
+        and isinstance(error.args[0], ReadTimeoutError)
+    )
+
+
 def _require_csv(start: bytes, content_type: str) -> None:
     """Raise DataNotReadyError when a response body is JSON or HTML, not CSV."""
     first = start.lstrip(b"\xef\xbb\xbf \t\r\n")[:1]
@@ -203,7 +221,7 @@ def safe_load_data_from_url(url: str, timeout: int = DOWNLOAD_READ_TIMEOUT, max_
         usecols: Columns to load; others are skipped. Columns missing from the
             feed are ignored here so validation can report them by name.
         retry_budget: Seconds from the start of the first attempt after which
-            no further attempt is made. With `timeout` it bounds how long a
+            no further attempt is started. With `timeout` it bounds how long a
             stalled portal is waited for; a download that is still coming in
             is not cut off by it.
 
@@ -262,12 +280,13 @@ def safe_load_data_from_url(url: str, timeout: int = DOWNLOAD_READ_TIMEOUT, max_
                 return df
 
         except Exception as e:
-            # Attempts that each waited out a silent portal add up: past the
-            # budget the failure is reported instead of tried once more
-            out_of_time = time.monotonic() - started >= retry_budget
+            # Attempts that each waited out a silent portal add up: one that
+            # could only start once the budget is spent (the wait before it
+            # counts) is not made, and the failure is reported instead
+            wait = 2 ** attempt
+            out_of_time = time.monotonic() - started + wait >= retry_budget
             if attempt >= max_retries or out_of_time or not is_transient_error(e):
                 raise
-            wait = 2 ** attempt
             logger.warning(
                 "Download attempt %d of %d failed, trying again in %ds: %s", attempt, max_retries, wait, e
             )
@@ -562,15 +581,23 @@ def refuse_shrunken_refresh(new: pd.DataFrame, previous: pd.DataFrame) -> None:
     figure without a word. Refused, the copy in use stays and the pages say
     that the refresh failed.
 
+    What to do if the feed really has shrunk is written to the log, for
+    whoever runs the app. The message raised is shown to every visitor, who
+    can do nothing about it.
+
     Raises:
         ValueError: `new` has fewer than MIN_REFRESH_ROW_SHARE of the rows of
             `previous`
     """
     if len(new) < len(previous) * MIN_REFRESH_ROW_SHARE:
+        logger.warning(
+            "Refusing a refresh with %d usable incidents, against %d in the copy in use. "
+            "If the feed really has shrunk, restart the app to accept it.",
+            len(new), len(previous),
+        )
         raise ValueError(
             f"the refreshed feed has only {len(new):,} usable incidents, against {len(previous):,} "
-            "in the copy shown; it may be incomplete or have lost its coordinates. "
-            "If the feed really has shrunk, restart the app to accept it"
+            "in the copy shown; it may be incomplete or have lost its coordinates"
         )
 
 

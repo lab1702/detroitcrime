@@ -1,5 +1,6 @@
 """Trends page — temporal analysis of crime incidents."""
 
+import logging
 from typing import Optional
 import streamlit as st
 import pandas as pd
@@ -14,6 +15,9 @@ from constants import (
 )
 from utils import daily_incident_counts, holiday_label, part_year_note, partial_years, project_full_year
 from theme import inject_css, apply_dark_plotly, BLUE_ACCENT
+
+# Named here: a page script's own `__name__` says nothing about which page it is
+logger = logging.getLogger("views.trends")
 
 # How solid the bar of a year the data covers only in part is drawn (1 is a whole year)
 PART_YEAR_OPACITY = 0.45
@@ -249,11 +253,13 @@ def create_forecast(df: pd.DataFrame, start, end) -> Optional[go.Figure]:
         )
     )
 
-    # Holiday annotations. Each holiday is marked once, on the day itself: the
-    # day it is observed on, when that is another one, is next to it and would
-    # put a second mark and name over the first. (The model is fitted on both.)
+    # Holiday annotations, for the days forecast: one on the last day of data
+    # is history, like the others in the months of history shown, which have
+    # no mark. Each holiday is marked once, on the day itself: the day it is
+    # observed on, when that is another one, is next to it and would put a
+    # second mark and name over the first. (The model is fitted on both.)
     forecast_holidays = holidays[
-        (holidays["ds"] >= forecast_start) & (holidays["ds"] <= future_dates["ds"].max())
+        (holidays["ds"] > forecast_start) & (holidays["ds"] <= future_dates["ds"].max())
         & ~holidays["holiday"].str.endswith("(observed)")
     ]
     if not forecast_holidays.empty:
@@ -305,6 +311,8 @@ if selected_year != "All":
 try:
     forecast_fig = create_forecast(df_all_years, data_start_date, data_end_date)
 except Exception as e:
+    # The page shows the message only: where it went wrong goes to the server log
+    logger.exception("Creating the forecast failed")
     st.error(f"Error creating forecast: {str(e)}")
 else:
     if forecast_fig is None:

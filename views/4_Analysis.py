@@ -1,5 +1,7 @@
 """Analysis page — interactive pivot table."""
 
+import logging
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -7,6 +9,9 @@ import plotly.express as px
 from constants import CHART_HEIGHT, PIVOT_COLUMNS, COLOR_SCALE_HEATMAP, CODE_LABEL_PREFIXES
 from utils import code_labels, day_labels
 from theme import inject_css, apply_dark_plotly, TEAL_ACCENT
+
+# Named here: a page script's own `__name__` says nothing about which page it is
+logger = logging.getLogger("views.analysis")
 
 # Numeric fields shown on a continuous axis that should only tick on whole numbers
 WHOLE_NUMBER_FIELDS = {"incident_year"}
@@ -122,4 +127,6 @@ try:
     st.dataframe(pivot_table, width="stretch")
 
 except Exception as e:
+    # The page shows the message only: where it went wrong goes to the server log
+    logger.exception("Creating the pivot table failed")
     st.error(f"Error creating pivot table: {str(e)}")

@@ -21,7 +21,7 @@ from constants import (
 from utils import (
     NO_CHANGE, TRANSIENT_ERRORS, DataNotReadyError, LoadFailedError, validate_data, safe_load_data_from_url,
     clean_and_filter_data, compute_yoy_deltas, daily_incident_counts, dataset_cache, format_daily_rate,
-    is_transient_error, selection_period,
+    is_timeout, is_transient_error, selection_period,
 )
 from theme import inject_css, apply_dark_plotly, BLUE_ACCENT, CATEGORY_CARD_KEY, GREEN_ACCENT, RED_ACCENT
 
@@ -67,7 +67,9 @@ def load_error_message(error: BaseException) -> str:
     """
     if isinstance(error, DataNotReadyError):
         return f"The data portal did not send the dataset ({error}). It may be rebuilding the export."
-    if isinstance(error, requests.exceptions.Timeout):
+    # Before its first byte or in the middle of the download: the second is
+    # not a Timeout to `requests`, and would read as a portal not reached
+    if is_timeout(error):
         return "The data portal took too long to answer."
     if isinstance(error, requests.exceptions.ConnectionError):
         return "The app could not reach the data portal."
@@ -106,7 +108,8 @@ def keep_current(moved_on: Callable[[], bool]) -> None:
 
     For a page that has nothing to wait for, which asks every
     DATA_IDLE_POLL_INTERVAL seconds. One left open would otherwise keep the
-    figures it was drawn with, whatever became of the data afterwards.
+    figures it was drawn with, whatever became of the data afterwards (or the
+    failure it was drawn with, after one that the cache is slow to try again).
     """
     if moved_on():
         st.rerun()
@@ -306,17 +309,25 @@ def main() -> None:
         failure, version = e.__cause__, e.version
         st.error(load_error_message(failure))
         # The cache leaves a failed first load alone for a while, then tries
-        # again for the next run that asks. A failure that can pass is asked
-        # about again from here as soon as that would come to anything: the
-        # cache's wait is over (it is timed from the failure, not from when
-        # this page was opened), or another visitor's page has set the load
-        # off. One that would only repeat (and may cost a whole download each
-        # time) waits for a reload, and the cache makes it wait longer each time.
+        # again for the next run that asks. An open page asks again from here
+        # as soon as that would come to anything: the cache's wait is over (it
+        # is timed from the failure, not from when this page was opened), or
+        # another visitor's page has set the load off.
         if is_transient_error(failure):
             update_when(
                 lambda: not cache.at_rest(version),
                 "The download will be tried again shortly, and this page will update by itself.",
             )
+        else:
+            # One that would only repeat may cost a whole download each time,
+            # so the cache makes it wait longer after each one in a row. What
+            # looks set to repeat can still pass (a 403 while the portal
+            # republishes the dataset, an export caught half written), so the
+            # page still looks again, now and then: it goes back for the data
+            # no sooner than the cache will try, and a screen left open is
+            # not left on a failure that is over.
+            st.caption("The download will be tried again later, and this page will update by itself.")
+            keep_current(lambda: not cache.at_rest(version))
         return
 
     if refresh_error is not None:
