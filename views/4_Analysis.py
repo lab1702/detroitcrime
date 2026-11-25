@@ -5,7 +5,7 @@ import pandas as pd
 import plotly.express as px
 
 from constants import CHART_HEIGHT, PIVOT_COLUMNS, COLOR_SCALE_HEATMAP, CODE_LABEL_PREFIXES
-from utils import code_labels, day_labels, numeric_codes
+from utils import code_labels, day_labels
 from theme import inject_css, apply_dark_plotly, TEAL_ACCENT
 
 # Numeric fields shown on a continuous axis that should only tick on whole numbers
@@ -77,15 +77,11 @@ st.session_state["pivot_columns_selection"] = columns
 try:
     df_sub = df_filtered[list({rows, columns})]
 
-    # Precinct, district and zip codes are pivoted as numbers, so they sort as
-    # numbers (Precinct 2 before Precinct 10), and are labelled afterwards.
-    # Rows without a valid code are left out.
-    for field in {rows, columns} & CODE_LABEL_PREFIXES.keys():
-        codes = numeric_codes(df_sub[field])
-        df_sub = df_sub.assign(**{field: codes})[codes != 0]
-
     # Counts rows. An incident with no value for one of the fields has no cell
     # to be counted in; how many there are is reported under the table.
+    # Precinct, district and zip codes were read as numbers when the data was
+    # loaded, with no value where there was no valid code: they sort as
+    # numbers (Precinct 2 before Precinct 10), and are labelled afterwards.
     pivot_table = pd.pivot_table(df_sub, index=rows, columns=columns, aggfunc="size", fill_value=0)
     left_out = len(df_filtered) - int(pivot_table.to_numpy().sum())
 

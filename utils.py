@@ -19,7 +19,8 @@ import requests
 import streamlit as st
 
 from constants import (
-    DATA_CACHE_TTL, DATA_FIRST_LOAD_RETRY_INTERVAL, DATA_MAX_RETRY_INTERVAL, DATA_RETRY_INTERVAL, DAY_LABELS,
+    CODE_LABEL_PREFIXES, DATA_CACHE_TTL, DATA_FIRST_LOAD_RETRY_INTERVAL, DATA_MAX_RETRY_INTERVAL,
+    DATA_RETRY_INTERVAL, DAY_LABELS, DOWNLOAD_READ_TIMEOUT, DOWNLOAD_RETRY_BUDGET,
     HOLIDAY_SHORT_NAMES, LOCAL_TIMEZONE, MAX_HOLIDAY_LABEL_LENGTH, MAX_UNPARSEABLE_DATE_SHARE,
     MIN_LAST_DAY_SHARE, MIN_PROJECTION_DAYS, MIN_REFRESH_ROW_SHARE, NUMBER_COLUMNS,
     REQUIRED_COLUMNS, TEXT_COLUMNS,
@@ -97,9 +98,13 @@ def code_labels(codes: Iterable[int], prefix: str = "") -> list[str]:
 def day_labels(days: Iterable[Any]) -> list[str]:
     """Names for the feed's ISO day numbers: 1 becomes "Monday", 7 "Sunday".
 
-    Anything else is shown as it is, so an unexpected value stays visible.
+    Anything else is shown as it is, so an unexpected value stays visible. So
+    is a missing value, which cannot be compared with the numbers.
     """
-    return [DAY_LABELS[int(day) - 1] if day in range(1, 8) else str(day) for day in days]
+    return [
+        DAY_LABELS[int(day) - 1] if not pd.isna(day) and day in range(1, 8) else str(day)
+        for day in days
+    ]
 
 
 def holiday_label(name: str) -> str:
@@ -118,26 +123,6 @@ def holiday_label(name: str) -> str:
             break
         kept = longer
     return (kept or short[:MAX_HOLIDAY_LABEL_LENGTH - 1]) + "…"
-
-
-def format_categorical_series(series: pd.Series, prefix: str = "") -> pd.Series:
-    """
-    Format a column of numeric codes (precinct, district, zip) as labels.
-
-    Invalid and zero entries are dropped, decimals are removed, and the
-    optional prefix is added (e.g. "Precinct 3"). Works on a single column so
-    callers do not need to copy the whole DataFrame.
-
-    Args:
-        series: Column to format
-        prefix: Optional prefix to add (e.g., "Precinct", "District")
-
-    Returns:
-        Series of string labels for the valid entries only
-    """
-    codes = numeric_codes(series)
-    labels = codes[codes != 0].astype(str)
-    return f"{prefix} " + labels if prefix else labels
 
 
 # ── Download ─────────────────────────────────────────────────────────────────
@@ -192,8 +177,9 @@ def _has_rows(csv_file: IO[bytes]) -> bool:
     return any(line.strip() for line in csv_file)
 
 
-def safe_load_data_from_url(url: str, timeout: int = 300, max_retries: int = 5,
-                            usecols: Optional[Iterable[str]] = None) -> pd.DataFrame:
+def safe_load_data_from_url(url: str, timeout: int = DOWNLOAD_READ_TIMEOUT, max_retries: int = 5,
+                            usecols: Optional[Iterable[str]] = None,
+                            retry_budget: float = DOWNLOAD_RETRY_BUDGET) -> pd.DataFrame:
     """
     Safely load data from URL with application-level retries.
 
@@ -211,10 +197,15 @@ def safe_load_data_from_url(url: str, timeout: int = 300, max_retries: int = 5,
 
     Args:
         url: URL to fetch data from
-        timeout: Read timeout in seconds
+        timeout: Read timeout in seconds: how long the portal may say nothing
+            before the attempt is given up
         max_retries: Number of full download attempts (at least 1)
         usecols: Columns to load; others are skipped. Columns missing from the
             feed are ignored here so validation can report them by name.
+        retry_budget: Seconds from the start of the first attempt after which
+            no further attempt is made. With `timeout` it bounds how long a
+            stalled portal is waited for; a download that is still coming in
+            is not cut off by it.
 
     Returns:
         DataFrame
@@ -231,6 +222,7 @@ def safe_load_data_from_url(url: str, timeout: int = 300, max_retries: int = 5,
     wanted = set(usecols) if usecols is not None else None
     column_filter = (lambda name: name in wanted) if wanted is not None else None
 
+    started = time.monotonic()
     attempt = 0
     while True:
         attempt += 1
@@ -270,7 +262,10 @@ def safe_load_data_from_url(url: str, timeout: int = 300, max_retries: int = 5,
                 return df
 
         except Exception as e:
-            if attempt >= max_retries or not is_transient_error(e):
+            # Attempts that each waited out a silent portal add up: past the
+            # budget the failure is reported instead of tried once more
+            out_of_time = time.monotonic() - started >= retry_budget
+            if attempt >= max_retries or out_of_time or not is_transient_error(e):
                 raise
             wait = 2 ** attempt
             logger.warning(
@@ -303,6 +298,7 @@ class _Load:
         self.done = threading.Event()
         self.value: Any = None
         self.error: Optional[BaseException] = None
+        self.version = 0  # the cache's version once this load had ended
 
 
 class LoadFailedError(Exception):
@@ -310,8 +306,13 @@ class LoadFailedError(Exception):
 
     Raised by `RefreshingCache.get`, a new one for each caller. The failure
     itself, which every caller is told of, is its `__cause__`: that one object
-    is shared between threads, so it is never raised again.
+    is shared between threads, so it is never raised again. `version` is the
+    cache's version at that failure (see `RefreshingCache.get_versioned`).
     """
+
+    def __init__(self, message: str, version: int = 0) -> None:
+        super().__init__(message)
+        self.version = version
 
 
 class RefreshingCache:
@@ -334,6 +335,12 @@ class RefreshingCache:
     start their own. Only the first load is waited for: a refresh runs behind
     the old value, which every caller, the one that set it off included, gets
     straight away. The new value is returned once the refresh has ended.
+
+    The cache counts the loads that have ended: its version. What `get`
+    returns can only change when a load ends, so a caller that keeps the
+    version it was given (see `get_versioned`) can ask later, with `at_rest`,
+    whether calling `get` again would come to anything new, without keeping
+    hold of the value itself.
 
     Args:
         ttl: Age at which the value is due for a refresh
@@ -380,6 +387,7 @@ class RefreshingCache:
         self._retry_wait = 0.0  # how long the last failure is left alone
         self._repeating = False  # whether that failure was one that would only repeat
         self._load: Optional[_Load] = None  # the load under way, if any
+        self._version = 0  # how many loads have ended
 
     def get(self, loader: Callable[[], Any]) -> Tuple[Any, Optional[BaseException]]:
         """Return (value, error), loading or refreshing with `loader` when due.
@@ -398,16 +406,28 @@ class RefreshingCache:
             LoadFailedError: the load failed with no earlier value to use;
                 its `__cause__` is the failure
         """
+        value, error, _ = self.get_versioned(loader)
+        return value, error
+
+    def get_versioned(self, loader: Callable[[], Any]) -> Tuple[Any, Optional[BaseException], int]:
+        """As `get`, with the cache's version as a third item: (value, error, version).
+
+        The version is the one the value and error stand at: the number of
+        loads that had ended when they were handed out. Keep it for `at_rest`.
+
+        Raises:
+            LoadFailedError: as for `get`; the version is its `version`
+        """
         with self._lock:
-            if self._has_value and self._clock() - self._loaded_at < self._ttl:
-                return self._value, None
+            if self._fresh():
+                return self._value, None, self._version
 
             load = self._load
             if load is None:
-                if self._failed_at is not None and self._clock() - self._failed_at < self._retry_wait:
+                if self._left_alone():
                     if self._has_value:
-                        return self._value, self._error
-                    raise LoadFailedError(str(self._error)) from self._error
+                        return self._value, self._error, self._version
+                    raise LoadFailedError(str(self._error), self._version) from self._error
                 load = _Load()
                 threading.Thread(
                     target=self._run, args=(loader, load), name="refreshing-cache-load", daemon=True
@@ -416,15 +436,23 @@ class RefreshingCache:
 
             # A refresh is under way: use what there is rather than wait
             if self._has_value:
-                return self._value, self._error
+                return self._value, self._error, self._version
 
         load.done.wait()
         if load.error is None:
-            return load.value, None
+            return load.value, None, load.version
         with self._lock:
             if self._has_value:
-                return self._value, load.error
-        raise LoadFailedError(str(load.error)) from load.error
+                return self._value, load.error, load.version
+        raise LoadFailedError(str(load.error), load.version) from load.error
+
+    def _fresh(self) -> bool:
+        """Whether there is a value that is not yet due for a refresh. Called with the lock held."""
+        return self._has_value and self._clock() - self._loaded_at < self._ttl
+
+    def _left_alone(self) -> bool:
+        """Whether the last load failed too recently to be tried again. Called with the lock held."""
+        return self._failed_at is not None and self._clock() - self._failed_at < self._retry_wait
 
     def _run(self, loader: Callable[[], Any], load: _Load) -> None:
         """Run one load on the cache's thread and record how it ended."""
@@ -446,6 +474,8 @@ class RefreshingCache:
             try:
                 with self._lock:
                     self._load = None
+                    self._version += 1
+                    load.version = self._version
                     # Timed from the end of the attempt: a failure that was slow
                     # to show itself still earns the full wait before the next try
                     now = self._clock()
@@ -496,16 +526,22 @@ class RefreshingCache:
             load = self._load
         return load is None or load.done.wait(timeout)
 
-    def up_to_date(self, value: Any, error: Optional[BaseException]) -> bool:
-        """Whether `value` and `error`, as `get` returned them, are still what there is.
+    def at_rest(self, version: int) -> bool:
+        """Whether `get` would do now just what it did at `version`, and start nothing.
 
-        False while a load is under way, and also when one has ended since
-        that `get`. Asking only whether a load is running would miss a refresh
+        False once a load has ended since that version was handed out, while
+        one is under way, and when the next `get` would start one: the value
+        is due for a refresh, or a failure has been left alone for long
+        enough. Asking only whether a load is running would miss a refresh
         that ended in between, and leave the caller with the old value and no
         reason to come back for the new one.
         """
         with self._lock:
-            return self._load is None and self._value is value and self._error is error
+            return (
+                self._version == version
+                and self._load is None
+                and (self._fresh() or self._left_alone())
+            )
 
     def expire(self) -> None:
         """Make the next `get` load again, whatever the age of the value or of a failure.
@@ -636,6 +672,15 @@ def clean_and_filter_data(df: pd.DataFrame, min_date: str,
     for column in NUMBER_COLUMNS:
         if column in df.columns:
             df[column] = whole_numbers(df[column])
+
+    # Precinct, district and zip codes are read here as well, once, so the
+    # pages only count and label them: reading one that arrived as text can
+    # take a second at the feed's size, which a page would spend again on
+    # every rerun. A cell that is not a valid code is missing.
+    for column in CODE_LABEL_PREFIXES:
+        if column in df.columns:
+            codes = numeric_codes(df[column])
+            df[column] = codes.where(codes != 0).astype("Int64")
 
     occurred = parse_feed_timestamps(df['incident_occurred_at'])
     df['incident_occurred_at'] = occurred.dt.tz_convert(local_timezone).dt.tz_localize(None)

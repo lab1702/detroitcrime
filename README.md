@@ -111,11 +111,12 @@ detroitcrime/
 
 ### Data Loading (`fetch_data()` and `dataset_cache()`)
 - Fetches data from Detroit Open Data Portal, retrying network errors, rate limiting, server errors and an export that arrives empty or with only its header (the portal empties the dataset while it reloads it)
-- Keeps the data for 24 hours, then refreshes it in the background: nobody waits for a refresh, and the previous copy is shown until the new one has arrived. A page that is open while a refresh runs says so, and draws itself again when the refresh has ended (it asks every 5 seconds), so a visitor who only looks once is not left with the old figures; that includes a refresh that ends just as the page is being drawn. If a refresh fails, the previous copy stays in use and a warning is shown
+- Gives up on a download attempt when the portal has said nothing for a minute, and starts no further attempt once two minutes have passed since the first, so a portal that has stalled is reported within a few minutes rather than waited for behind a spinner; a download that is still coming in is not cut off
+- Keeps the data for 24 hours, then refreshes it in the background: nobody waits for a refresh, and the previous copy is shown until the new one has arrived. A page that is open while a refresh runs says so, and draws itself again when the refresh has ended (it asks every 5 seconds), so a visitor who only looks once is not left with the old figures; that includes a refresh that ends just as the page is being drawn. A page that is left open with nothing to wait for looks again once a minute: it follows a refresh that another visitor set off, and sets the refresh off itself once the data is 24 hours old (or a failed refresh is due another try), so a dashboard left open does not keep the figures it was first drawn with. If a refresh fails, the previous copy stays in use and a warning is shown
 - Refuses a refresh that has fewer than 90% of the incidents of the copy in use (a short export, or one that has lost its coordinates): the copy in use stays, with the warning. If the feed really has shrunk that much, restart the app to accept it
 - Tries a failed refresh again after 15 minutes. A failure that would only repeat (a refused refresh, a feed that has lost a column, a 404) costs a whole download each time, so it waits twice as long after each one in a row: 15 minutes, 30, an hour, up to six hours (not longer: a short export made while the portal reloads its data looks like a feed that has shrunk, and does pass). A failed first load is spaced out the same way, starting from its one minute
 - Downloads on a background thread shared by every session: visitors who arrive during the first download wait for that one, and a click while waiting does not restart it
-- A failed first load is reported to every visitor and tried again after a minute, rather than repeated for each of them. When the failure is one that can pass (network trouble, rate limiting, a server error, a portal that is not ready), an open page goes back for the data by itself once that minute is up; one that would only repeat, such as a 404 or a feed that cannot be read, waits for a reload
+- A failed first load is reported to every visitor and tried again after a minute, rather than repeated for each of them. When the failure is one that can pass (network trouble, rate limiting, a server error, a portal that is not ready), an open page goes back for the data by itself once that minute is up (it is counted from the failure, whenever the page was opened); one that would only repeat, such as a 404 or a feed that cannot be read, waits for a reload
 - A load that fails is written to the server log with its traceback; the pages show only the message
 - Cleans and filters data for quality
 - Removes invalid coordinates and recent incomplete data
@@ -173,6 +174,7 @@ The application implements several data quality measures:
 - Filters data from 2018-01-01 onwards for consistency
 - Trims padded text values so the same value is not counted twice, and treats a value that is only padding as missing
 - Reads the feed's day-of-week and hour-of-day fields as whole numbers, and treats a value that is not one as missing
+- Reads precinct, district and zip codes as whole numbers once, when the data is loaded, and treats a value that is not a valid code as missing
 - Replaces bytes that are not valid UTF-8 instead of refusing the file
 
 ## Development Notes

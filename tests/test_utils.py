@@ -16,8 +16,7 @@ from constants import REQUIRED_COLUMNS
 from theme import BLUE_ACCENT, CATEGORY_CARD_KEY, CUSTOM_CSS, RED_ACCENT, apply_dark_plotly
 from utils import (
     DataNotReadyError, LoadFailedError, RefreshingCache, clean_and_filter_data, code_labels,
-    compute_yoy_deltas, daily_incident_counts, day_labels, format_categorical_series, format_change,
-    format_daily_rate, holiday_label, numeric_codes, part_year_note, partial_years, project_full_year,
+    compute_yoy_deltas, daily_incident_counts, day_labels, format_change, format_daily_rate, holiday_label, numeric_codes, part_year_note, partial_years, project_full_year,
     refuse_shrunken_refresh, safe_load_data_from_url, same_day_last_year, selection_period,
 )
 
@@ -351,12 +350,25 @@ class TestYearOverYear:
 
 
 class TestCategoricalFormatting:
-    def test_series_drops_invalid_and_adds_prefix(self):
-        codes = pd.Series([3.0, 11, "07", None, 0, "n/a"], index=list("abcdef"))
-        assert format_categorical_series(codes, "Precinct").to_dict() == {
-            "a": "Precinct 3", "b": "Precinct 11", "c": "Precinct 7",
-        }
-        assert format_categorical_series(pd.Series([48226.0, None])).tolist() == ["48226"]
+    def test_codes_are_read_on_load_and_anything_invalid_is_missing(self):
+        # One odd cell makes read_csv hand over a whole code column as text.
+        # The pages count and label the codes; they are read here, once.
+        stamps = [f"2024/03/01 {hour}:00:00+00" for hour in range(10, 16)] + [LATER]
+        df = clean(feed_rows(
+            stamps,
+            police_precinct=[3.0, 11, "07", None, 0, "n/a", 5],
+            zip_code=["48201", "48226-1234", " 48207 ", "", "48210", "48201", "48201"],
+            council_district=[1, 2, 3, 4, 5, 6, 7],
+        ))
+        for column in ("police_precinct", "zip_code", "council_district"):
+            assert pd.api.types.is_integer_dtype(df[column])
+        assert df["police_precinct"].isna().tolist() == [False, False, False, True, True, True]
+        assert df["police_precinct"].dropna().tolist() == [3, 11, 7]
+        assert df["zip_code"].isna().tolist() == [False, True, False, True, False, False]
+        assert df["zip_code"].dropna().tolist() == [48201, 48207, 48210, 48201]
+        assert df["council_district"].tolist() == [1, 2, 3, 4, 5, 6]
+        # Missing codes are not counted, and the rest need no reading again
+        assert df["police_precinct"].value_counts().to_dict() == {3: 1, 11: 1, 7: 1}
 
     def test_codes_are_numbers_with_zero_for_anything_invalid(self):
         assert numeric_codes(pd.Series([3.0, "07", None, "n/a", 0, "48201-1234"])).tolist() == [3, 7, 0, 0, 0, 0]
@@ -369,7 +381,6 @@ class TestCategoricalFormatting:
 
     def test_codes_are_above_zero_and_written_as_plain_numbers(self):
         assert numeric_codes(pd.Series([-3, 5, 0])).tolist() == [0, 5, 0]
-        assert format_categorical_series(pd.Series([-3, 5]), "Precinct").tolist() == ["Precinct 5"]
         # A parser takes these for 1000, 16 and 1; nobody writes a precinct that way
         odd = pd.Series(["1e3", "0x10", "True", " 7 ", "-2", True])
         assert numeric_codes(odd).tolist() == [0, 0, 0, 7, 0, 0]
@@ -382,6 +393,9 @@ class TestCategoricalFormatting:
     def test_days_are_named_iso_style(self):
         assert day_labels([1, 2.0, 7]) == ["Monday", "Tuesday", "Sunday"]
         assert day_labels([0, 8]) == ["0", "8"]
+        # A missing value cannot be compared with the numbers: it used to raise
+        assert day_labels(pd.array([1, None, 7], dtype="Int64")) == ["Monday", "<NA>", "Sunday"]
+        assert day_labels([float("nan"), None]) == ["nan", "None"]
 
     def test_holiday_names_fit_beside_their_marks(self):
         assert holiday_label("Labor Day") == "Labor Day"
@@ -576,6 +590,49 @@ class TestDownload:
     def test_needs_at_least_one_attempt(self, portal):
         with pytest.raises(ValueError, match="max_retries"):
             safe_load_data_from_url(URL, max_retries=0)
+
+    def test_stalled_portal_is_given_up_on_within_the_retry_budget(self, monkeypatch):
+        # Each attempt waits a minute for a portal that says nothing. Five of
+        # them at five minutes each kept the first visitors at a spinner for
+        # 25 minutes before they were told anything.
+        class Time:
+            """Stands in for the time module: a clock that moves only when told to."""
+
+            now = 0.0
+
+            def monotonic(self) -> float:
+                return self.now
+
+            def sleep(self, seconds: float) -> None:
+                self.now += seconds
+
+        clock = Time()
+        attempts = []
+
+        def stalled(*args, **kwargs):
+            attempts.append(clock.now)
+            clock.now += 60
+            raise requests.exceptions.ReadTimeout("read timed out")
+
+        monkeypatch.setattr(utils, "time", clock)
+        monkeypatch.setattr(utils.requests, "get", stalled)
+        with pytest.raises(requests.exceptions.ReadTimeout):
+            safe_load_data_from_url(URL, retry_budget=120)
+        # Tried once more, 2 seconds after the first; by then the time is up
+        assert attempts == [0, 62]
+
+    def test_silent_portal_is_waited_for_no_longer_than_the_read_timeout(self, monkeypatch):
+        asked_with = {}
+
+        def fake_get(url, **kwargs):
+            asked_with.update(kwargs)
+            return FakeResponse()
+
+        monkeypatch.setattr(utils.requests, "get", fake_get)
+        safe_load_data_from_url(URL)
+        assert asked_with["timeout"] == (15, utils.DOWNLOAD_READ_TIMEOUT)
+        # A silent attempt, the wait after it and a second one are over within a few minutes
+        assert 2 * utils.DOWNLOAD_READ_TIMEOUT <= utils.DOWNLOAD_RETRY_BUDGET <= 300
 
     def test_stray_invalid_byte_costs_one_character_not_the_load(self, portal):
         portal.append(FakeResponse(b"latitude,nearest_intersection\n42.3,Caf\xe9 Ave\n"))
@@ -1003,35 +1060,80 @@ class TestRefreshingCache:
         # then is left alone for the usual 10, not for twice the last wait
         assert self.attempts_over(cache, clock, 150, load) == [0, 10, 30, 130, 140]
 
-    def test_up_to_date_until_a_load_starts_or_ends(self, cache, clock):
-        value, error = cache.get(loader("first"))
-        assert cache.up_to_date(value, error)
+    def test_at_rest_until_a_load_is_due_starts_or_ends(self, cache, clock):
+        value, error, version = cache.get_versioned(loader("first"))
+        assert (value, error) == ("first", None)
+        assert cache.at_rest(version)
 
+        # Due for a refresh: asking again would set one off
         clock.now += 100
+        assert not cache.at_rest(version)
         release = threading.Event()
 
         def slow_refresh():
             release.wait(timeout=5)
             return "second"
 
-        value, error = cache.get(slow_refresh)
-        assert not cache.up_to_date(value, error)  # a refresh is under way
+        assert cache.get_versioned(slow_refresh) == ("first", None, version)
+        assert not cache.at_rest(version)  # a refresh is under way
         release.set()
         assert cache.wait(timeout=5)
         # Nothing is running now, but what the caller was given has been replaced.
         # A caller that only asked whether a load was running would never know.
         assert cache.wait(timeout=0)
-        assert not cache.up_to_date(value, error)
-        assert cache.up_to_date(*cache.get(loader()))
+        assert not cache.at_rest(version)
+        value, error, newer = cache.get_versioned(loader())
+        assert (value, error) == ("second", None)
+        assert newer != version and cache.at_rest(newer)
 
-    def test_not_up_to_date_once_a_refresh_has_failed(self, cache, clock):
-        value, error = cache.get(loader("first"))
+    def test_version_changes_only_when_a_load_ends(self, cache):
+        first = cache.get_versioned(loader("first"))
+        assert cache.get_versioned(loader()) == first
+        cache.expire()
+        assert not cache.at_rest(first[2])  # the next get refreshes
+        # The refresh runs behind the old value, which still stands at its version
+        assert cache.get_versioned(loader("second")) == first
+        assert cache.wait(timeout=5)
+        value, error, version = cache.get_versioned(loader())
+        assert (value, error) == ("second", None)
+        assert version != first[2]
+
+    def test_not_at_rest_once_a_refresh_has_failed_or_is_due_another_try(self, cache, clock):
+        down = RuntimeError("portal down")
+        value, error, version = cache.get_versioned(loader("first"))
         clock.now += 100
-        assert cache.get(loader(RuntimeError("portal down"))) == (value, None)
+        assert cache.get_versioned(loader(down)) == (value, None, version)
         assert cache.wait(timeout=5)
         # The value is the same one, but there is a failure to report with it now
-        assert not cache.up_to_date(value, None)
-        assert cache.up_to_date(*cache.get(loader()))
+        assert not cache.at_rest(version)
+        value, error, version = cache.get_versioned(loader())
+        assert (value, error) == ("first", down)
+        # The failure is left alone for a while: nothing to come back for yet...
+        assert cache.at_rest(version)
+        clock.now += 9
+        assert cache.at_rest(version)
+        # ...until it is due another try
+        clock.now += 1
+        assert not cache.at_rest(version)
+
+    def test_failed_first_load_is_at_rest_until_it_is_due_another_try(self, cache, clock):
+        with pytest.raises(LoadFailedError) as told_at_once:
+            cache.get(loader(RuntimeError("portal down")))
+        # A caller that comes two seconds later is told of the same failure at
+        # the same version, and can ask when coming back is worth it: that is
+        # timed from the failure, not from when the caller was told
+        clock.now += 2
+        with pytest.raises(LoadFailedError) as told_later:
+            cache.get_versioned(loader())
+        version = told_later.value.version
+        assert version == told_at_once.value.version
+        assert cache.at_rest(version)
+        clock.now += 1
+        assert not cache.at_rest(version)
+        assert cache.get_versioned(loader("first"))[:2] == ("first", None)
+
+    def test_not_at_rest_before_anything_has_loaded(self, cache):
+        assert not cache.at_rest(0)
 
 
 class TestShrunkenRefresh:

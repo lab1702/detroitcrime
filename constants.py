@@ -70,6 +70,19 @@ DATA_MAX_RETRY_INTERVAL = 21600  # 6 hours
 # How often an open page that is waiting for a download asks whether it has
 # ended, so that it can show the result without the user clicking anything.
 DATA_POLL_INTERVAL = 5
+# How often a page with nothing to wait for asks whether that is still so. A
+# page left open follows a refresh that another visitor set off, and sets one
+# off itself once the data is due, within this long.
+DATA_IDLE_POLL_INTERVAL = 60
+# How long the portal may say nothing before a download attempt is given up.
+# The whole export arrives in seconds, so one that is silent this long has
+# stalled.
+DOWNLOAD_READ_TIMEOUT = 60
+# No further attempt at a download is started once this long has passed since
+# the first began. A first load is waited for, and until it ends its visitors
+# see only a spinner: this bounds that to a few minutes with a stalled portal.
+# A download that is still coming in is not cut off by it.
+DOWNLOAD_RETRY_BUDGET = 120
 FORECAST_CACHE_TTL = 3600  # 1 hour
 YOY_CACHE_TTL = 1800  # 30 minutes
 
@@ -109,7 +122,8 @@ NUMBER_COLUMNS = [
 ]
 
 # Columns holding numeric codes, with the prefix used to label each code
-# (e.g. 3 -> "Precinct 3"; zip codes are shown as they are).
+# (e.g. 3 -> "Precinct 3"; zip codes are shown as they are). They are read as
+# whole numbers above zero on load; a cell that is not one is missing.
 CODE_LABEL_PREFIXES = {
     'zip_code': '',
     'police_precinct': 'Precinct',

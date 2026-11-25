@@ -74,7 +74,7 @@ The application implements several data quality measures:
 - **Empty Export**: The portal empties the dataset while it reloads it, and an export made then is empty or has only its header. That is taken for a portal that is not ready, and the download is tried again. A file that has rows but lacks the columns the app reads is a feed that has changed: it is reported by the columns it lacks, and tried again less and less often
 - **Shrunken Refresh**: A refresh left with fewer than 90% of the incidents of the copy in use is refused as incomplete (a short export, or coordinates gone missing), and the copy in use is kept. A first load has nothing to be compared with and is taken as it comes
 - **Real-time Exclusion**: Excludes the feed's last day, and anything dated after it, to avoid incomplete data. The last day is the latest one with at least 10% of a typical (median) day's incidents, so a lone row with a mistyped later date is not taken for it
-- **Categorical Formatting**: Zip codes, precincts and districts are read as numeric codes; rows without a valid code (a whole number above zero, written as a plain number) are left out of charts that group by them (the pivot says how many)
+- **Categorical Formatting**: Zip codes, precincts and districts are read as numeric codes when the data is loaded; a value that is not a valid code (a whole number above zero, written as a plain number) is treated as missing, and those rows are left out of charts that group by them (the pivot says how many)
 
 ## Data Quality Notes
 

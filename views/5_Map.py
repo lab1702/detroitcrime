@@ -113,12 +113,14 @@ if mode == "Scatter":
         channel = {name: rgb[index] for name, rgb in color_map.items()}
         return category.map(channel).fillna(OTHER_COLOR[index]).astype(int)
 
-    # Plain columns only; missing text would serialize as NaN, which is not valid JSON
+    # Plain columns only; missing text would serialize as NaN, which is not valid JSON.
+    # A column that is empty throughout was read as numbers, which take no
+    # text to fill their gaps with: it is filled as a column of objects.
     df_scatter = pd.DataFrame({
         "lat": df_points["latitude"].round(5),
         "lon": df_points["longitude"].round(5),
-        "category": category.fillna("Unknown"),
-        "location": df_points["nearest_intersection"].fillna("Unknown location"),
+        "category": category.astype(object).fillna("Unknown"),
+        "location": df_points["nearest_intersection"].astype(object).fillna("Unknown location"),
         "r": color_channel(0),
         "g": color_channel(1),
         "b": color_channel(2),

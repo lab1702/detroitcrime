@@ -5,7 +5,6 @@ Handles data loading, caching, sidebar filters, session state,
 and displays the Overview page (KPIs, summary charts, daily sparkline).
 """
 
-import time
 from datetime import date
 from typing import Callable
 
@@ -17,7 +16,7 @@ import requests
 from constants import (
     DATA_URL, REQUIRED_COLUMNS,
     MIN_DATE, DETROIT_LAT_MIN, DETROIT_LAT_MAX, DETROIT_LON_MIN, DETROIT_LON_MAX,
-    CHART_HEIGHT, TOP_N_ITEMS, DATA_FIRST_LOAD_RETRY_INTERVAL, DATA_POLL_INTERVAL,
+    CHART_HEIGHT, TOP_N_ITEMS, DATA_IDLE_POLL_INTERVAL, DATA_POLL_INTERVAL,
 )
 from utils import (
     NO_CHANGE, TRANSIENT_ERRORS, DataNotReadyError, LoadFailedError, validate_data, safe_load_data_from_url,
@@ -59,19 +58,22 @@ def fetch_data() -> pd.DataFrame:
 
 
 def load_error_message(error: BaseException) -> str:
-    """Describe a failed data load for the user."""
+    """Describe a failed data load for the user.
+
+    The download is the app's, not the visitor's: a failure is told as what
+    happened between the app and the data portal, and asks nothing of the
+    reader, who can do nothing about it. What is done next (the page trying
+    again by itself, the last copy staying in use) is said where it is shown.
+    """
     if isinstance(error, DataNotReadyError):
-        return (
-            f"The data portal did not send the dataset ({error}). "
-            "It may be rebuilding the export; please try again in a few minutes."
-        )
+        return f"The data portal did not send the dataset ({error}). It may be rebuilding the export."
     if isinstance(error, requests.exceptions.Timeout):
-        return "Request timed out. The data source may be slow. Please try again."
+        return "The data portal took too long to answer."
     if isinstance(error, requests.exceptions.ConnectionError):
-        return "Connection failed. Please check your internet connection and try again."
+        return "The app could not reach the data portal."
     if isinstance(error, TRANSIENT_ERRORS):
         # What is left of them: a download cut short, or one that could not be decoded
-        return "The download was interrupted before it finished. Please try again."
+        return "The download from the data portal was interrupted before it finished."
     if isinstance(error, requests.exceptions.HTTPError):
         if is_transient_error(error):
             return f"Server error: {error}. The data source may be temporarily unavailable."
@@ -95,6 +97,18 @@ def update_when(ready: Callable[[], bool], note: str) -> None:
     """
     st.caption(note)
     if ready():
+        st.rerun()
+
+
+@st.fragment(run_every=DATA_IDLE_POLL_INTERVAL)
+def keep_current(moved_on: Callable[[], bool]) -> None:
+    """Draw the whole page again once `moved_on()` says so. It shows nothing.
+
+    For a page that has nothing to wait for, which asks every
+    DATA_IDLE_POLL_INTERVAL seconds. One left open would otherwise keep the
+    figures it was drawn with, whatever became of the data afterwards.
+    """
+    if moved_on():
         st.rerun()
 
 
@@ -278,23 +292,29 @@ def main() -> None:
     # failure is reported. Only the first download is waited for, and it runs
     # on the cache's own thread, so a click that interrupts this script does
     # not throw it away.
+    #
+    # `version` stands for what this run was handed. The cache is at rest at
+    # it for as long as another run would be handed the same and start
+    # nothing: no load has ended since, none is under way, and none is due.
+    # A page keeps the version to ask about, never the data.
     cache = dataset_cache()
     try:
         with st.spinner("Downloading Detroit crime data..."):
-            df, refresh_error = cache.get(fetch_data)
+            df, refresh_error, version = cache.get_versioned(fetch_data)
     except LoadFailedError as e:
         # One of these is raised for each visitor; the failure itself is its cause
-        failure = e.__cause__
+        failure, version = e.__cause__, e.version
         st.error(load_error_message(failure))
         # The cache leaves a failed first load alone for a while, then tries
         # again for the next run that asks. A failure that can pass is asked
-        # about again from here once that time is up; one that would only
-        # repeat (and may cost a whole download each time) waits for a reload,
-        # and the cache makes it wait longer each time.
+        # about again from here as soon as that would come to anything: the
+        # cache's wait is over (it is timed from the failure, not from when
+        # this page was opened), or another visitor's page has set the load
+        # off. One that would only repeat (and may cost a whole download each
+        # time) waits for a reload, and the cache makes it wait longer each time.
         if is_transient_error(failure):
-            retry_at = time.monotonic() + DATA_FIRST_LOAD_RETRY_INTERVAL
             update_when(
-                lambda: time.monotonic() >= retry_at,
+                lambda: not cache.at_rest(version),
                 "The download will be tried again shortly, and this page will update by itself.",
             )
         return
@@ -305,11 +325,18 @@ def main() -> None:
             + load_error_message(refresh_error)
         )
 
-    # A refresh is running behind the copy shown here: say so, and draw the
-    # page again when it has ended, with the new data or with the reason there
-    # is none. The same goes for one that ended after this run was handed its
-    # copy, which asking only whether one is running would miss.
-    if not cache.up_to_date(df, refresh_error):
+    if cache.at_rest(version):
+        # Nothing to wait for. A page left open looks again now and then, and
+        # is drawn again once that is no longer so: to show what a refresh set
+        # off by another visitor has brought, or to set the refresh off itself
+        # when the data is due one (or a failed one is due another try).
+        keep_current(lambda: not cache.at_rest(version))
+    else:
+        # A refresh is running behind the copy shown here: say so, and draw
+        # the page again when it has ended, with the new data or with the
+        # reason there is none. The same goes for one that ended after this
+        # run was handed its copy, which asking only whether one is running
+        # would miss.
         update_when(
             lambda: cache.wait(timeout=0),
             "Newer data is being downloaded. This page will update when it is ready.",

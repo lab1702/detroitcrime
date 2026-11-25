@@ -3,6 +3,7 @@
 import base64
 import json
 import threading
+import warnings
 from datetime import timedelta
 from pathlib import Path
 
@@ -300,7 +301,7 @@ def test_first_load_failure_is_reported(monkeypatch):
     at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
     at.run()
     assert [e.value for e in at.error] == [
-        "Connection failed. Please check your internet connection and try again."
+        "The app could not reach the data portal."
     ]
     assert not at.metric
     # A fault on the line can pass: the page says it will look again by itself
@@ -308,10 +309,7 @@ def test_first_load_failure_is_reported(monkeypatch):
 
 
 def test_passing_first_load_failure_is_tried_again_without_a_reload(raw_feed, monkeypatch):
-    # No wait before another try, so the page is at once due to look again
-    import constants
-
-    monkeypatch.setattr(constants, "DATA_FIRST_LOAD_RETRY_INTERVAL", 0)
+    # The cache waits no time before another try, so the page is at once due to look again
     monkeypatch.setattr(utils, "DATA_FIRST_LOAD_RETRY_INTERVAL", 0)
     downloads = []
 
@@ -380,7 +378,7 @@ def test_failed_first_load_is_not_repeated_by_the_next_rerun(monkeypatch):
     # The second run reports the same failure without downloading again
     assert len(downloads) == 1
     assert [e.value for e in at.error] == [
-        "Connection failed. Please check your internet connection and try again."
+        "The app could not reach the data portal."
     ]
 
 
@@ -391,7 +389,20 @@ def test_download_cut_short_is_reported_in_plain_words(monkeypatch):
     monkeypatch.setattr(utils, "safe_load_data_from_url", cut_short)
     at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
     at.run()
-    assert [e.value for e in at.error] == ["The download was interrupted before it finished. Please try again."]
+    assert [e.value for e in at.error] == ["The download from the data portal was interrupted before it finished."]
+
+
+def test_failure_is_not_put_to_the_visitor_to_fix(monkeypatch):
+    # The download is the app's: the visitor's own connection is fine (the page
+    # reached them), and the page says it will try again by itself
+    def timed_out(url, **kwargs):
+        raise requests.exceptions.ReadTimeout("read timed out")
+
+    monkeypatch.setattr(utils, "safe_load_data_from_url", timed_out)
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
+    at.run()
+    assert [e.value for e in at.error] == ["The data portal took too long to answer."]
+    assert [c.value for c in at.caption] == [RETRY_NOTE]
 
 
 def test_failed_refresh_keeps_showing_the_last_data(overview, monkeypatch):
@@ -414,7 +425,7 @@ def test_failed_refresh_keeps_showing_the_last_data(overview, monkeypatch):
     assert not overview.exception and not overview.error
     assert [w.value for w in overview.warning] == [
         "The data could not be refreshed, so the last copy that loaded is shown. "
-        "Connection failed. Please check your internet connection and try again."
+        "The app could not reach the data portal."
     ]
     assert not overview.caption  # nothing is being downloaded any more
     assert {m.label for m in overview.metric} >= {"Total Incidents", "Avg Daily"}
@@ -451,14 +462,14 @@ class WaitingCache:
         self.still_running = still_running
         self.gets = 0
 
-    def get(self, loader):
+    def get_versioned(self, loader):
         self.gets += 1
-        return self.df, None
+        return self.df, None, self.gets
 
     def wait(self, timeout=None) -> bool:
         return not (self.still_running.pop(0) if self.still_running else False)
 
-    def up_to_date(self, value, error) -> bool:
+    def at_rest(self, version) -> bool:
         return self.wait()
 
 
@@ -494,8 +505,8 @@ def test_refresh_that_ends_as_the_page_starts_is_not_missed(clean_df, monkeypatc
     # asking about it: nothing is running any more, but what the page holds is
     # no longer what there is. It used to stay on the old figures.
     class JustEnded(WaitingCache):
-        def up_to_date(self, value, error) -> bool:
-            return self.gets > 1
+        def at_rest(self, version) -> bool:
+            return version > 1
 
     cache = JustEnded(clean_df, still_running=[])
     monkeypatch.setattr(utils, "dataset_cache", lambda: cache)
@@ -505,6 +516,83 @@ def test_refresh_that_ends_as_the_page_starts_is_not_missed(clean_df, monkeypatc
     assert not at.exception, at.exception
     assert cache.gets == 2
     assert not at.caption
+    assert at.metric
+
+
+class RestingCache(WaitingCache):
+    """Stands in for the dataset cache with nothing under way.
+
+    `at_rest_answers` is what it says, in turn, each time it is asked whether
+    it is still at rest; after that it is. It notes the version asked about.
+    """
+
+    def __init__(self, df: pd.DataFrame, at_rest_answers: list[bool]):
+        super().__init__(df, still_running=[])
+        self.at_rest_answers = at_rest_answers
+        self.asked_about = []
+
+    def at_rest(self, version) -> bool:
+        self.asked_about.append(version)
+        return self.at_rest_answers.pop(0) if self.at_rest_answers else True
+
+
+def test_page_left_open_is_drawn_again_once_the_cache_has_moved_on(clean_df, monkeypatch):
+    # Nothing to wait for when the page is drawn. Afterwards another visitor
+    # sets a refresh off, or the data comes due: the page asks now and then
+    # (here it is on its first time of asking), and used to keep its figures.
+    cache = RestingCache(clean_df, at_rest_answers=[True, False])
+    monkeypatch.setattr(utils, "dataset_cache", lambda: cache)
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
+    at.run()
+
+    assert not at.exception, at.exception
+    assert cache.gets == 2
+    # It asked about the copy it was handed each time, and says nothing while it waits
+    assert cache.asked_about == [1, 1, 2, 2]
+    assert not at.caption
+    assert at.metric
+
+
+def test_page_left_open_stays_as_it_is_while_the_cache_is_at_rest(clean_df, monkeypatch):
+    cache = RestingCache(clean_df, at_rest_answers=[])
+    monkeypatch.setattr(utils, "dataset_cache", lambda: cache)
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
+    at.run()
+
+    assert not at.exception, at.exception
+    assert cache.gets == 1
+    assert not at.caption
+    assert at.metric
+
+
+def test_failed_first_load_is_tried_again_when_the_cache_says_it_is_due(clean_df, monkeypatch):
+    # The page arrives late in the cache's wait. It goes back for the data
+    # when the cache is due another try, not a whole wait after it was opened.
+    class FailedOnce(RestingCache):
+        def get_versioned(self, loader):
+            if self.gets == 0:
+                self.gets += 1
+                error = utils.LoadFailedError("portal down", version=7)
+                raise error from requests.exceptions.ConnectionError("portal down")
+            return super().get_versioned(loader)
+
+    # At rest when the page is drawn...
+    cache = FailedOnce(clean_df, at_rest_answers=[True])
+    monkeypatch.setattr(utils, "dataset_cache", lambda: cache)
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
+    at.run()
+    assert [e.value for e in at.error] == ["The app could not reach the data portal."]
+    assert [c.value for c in at.caption] == [RETRY_NOTE]
+    assert (cache.gets, cache.asked_about) == (1, [7])
+
+    # ...and due another try by the time a page asks again
+    cache = FailedOnce(clean_df, at_rest_answers=[False])
+    monkeypatch.setattr(utils, "dataset_cache", lambda: cache)
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
+    at.run()
+    assert not at.exception, at.exception
+    assert cache.gets == 2
+    assert not at.error and not at.caption
     assert at.metric
 
 
@@ -928,12 +1016,37 @@ def test_geography_charts(page_state):
     assert set(zips) == {"48201", "48226", "48207", "48210"}
 
 
-def test_geography_without_a_value_to_count(page_state, clean_df):
-    # No incident in the selection has a neighborhood or a usable zip code
-    nowhere = clean_df.assign(neighborhood=np.nan, zip_code="unknown")
-    at = run_page("3_Geography.py", dict(page_state, df_filtered=nowhere))
+def test_geography_without_a_value_to_count(raw_feed):
+    # No incident has a neighborhood or a usable zip code
+    nowhere = clean_feed(raw_feed.assign(neighborhood=np.nan, zip_code="unknown"))
+    at = run_page("3_Geography.py", make_page_state(nowhere))
     assert [i.value for i in at.info] == ["Nothing recorded for this selection."] * 2
     assert len(plotly_figures(at)) == 3
+
+
+def test_incidents_without_a_valid_code_are_left_out_where_codes_are_counted(raw_feed):
+    # One zip code written with its extension makes read_csv hand over the
+    # whole column as text. The codes are read once, when the data is loaded.
+    feed = raw_feed.assign(zip_code=raw_feed["zip_code"].astype(str))
+    feed.loc[feed.index[:40], "zip_code"] = "48201-1234"
+    df = clean_feed(feed)
+    odd = int(df["zip_code"].isna().sum())
+    assert 0 < odd <= 40
+
+    at = run_page("3_Geography.py", make_page_state(df))
+    zips = plotly_figures(at)[3]["data"][0]
+    assert set(zips["y"]) == {"48201", "48226", "48207", "48210"}
+    assert sum(values(zips["x"])) == len(df) - odd
+
+    # The pivot counts the same incidents, and says how many it has no cell for
+    at = run_page("4_Analysis.py", dict(make_page_state(df), pivot_rows_selection="zip_code"))
+    assert not at.error
+    table = at.dataframe[0].value
+    assert table.index.tolist() == ["48201", "48207", "48210", "48226"]
+    assert int(table.to_numpy().sum()) == len(df) - odd
+    assert [c.value for c in at.caption] == [
+        f"{odd} of {len(df):,} incidents have no zip_code or case_status and are not in the table."
+    ]
 
 
 # ── Map ──────────────────────────────────────────────────────────────────────
@@ -995,6 +1108,19 @@ def test_map_scatter_payload(page_state, clean_df):
     tooltip = json.loads(at.get("deck_gl_json_chart")[0].proto.tooltip)
     assert tooltip["text"] == "{category}\n{location}"
     assert "html" not in tooltip
+
+
+def test_map_with_a_column_that_is_empty_throughout(page_state, clean_df):
+    # A column with nothing in it is read as numbers. Filling its gaps with
+    # text is deprecated in pandas, and an error from pandas 4 on.
+    empty = clean_df.assign(offense_category=np.nan, nearest_intersection=np.nan)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=".*not supported as a fill value")
+        at = run_page("5_Map.py", dict(page_state, df_filtered=empty))
+
+    points = deck_spec(at)["layers"][0]["data"]
+    assert len(points) == len(clean_df)
+    assert {(p["category"], p["location"]) for p in points} == {("Unknown", "Unknown location")}
 
 
 def test_map_samples_very_wide_selections(page_state, clean_df):

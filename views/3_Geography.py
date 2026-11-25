@@ -4,8 +4,8 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-from constants import CHART_HEIGHT, TOP_N_ITEMS
-from utils import format_categorical_series
+from constants import CHART_HEIGHT, CODE_LABEL_PREFIXES, TOP_N_ITEMS
+from utils import code_labels
 from theme import inject_css, apply_dark_plotly, RED_ACCENT, AMBER_ACCENT
 
 inject_css()
@@ -46,6 +46,18 @@ def bar_chart(counts: pd.Series, y_label: str, accent: str, height: int = CHART_
     st.plotly_chart(fig, width="stretch")
 
 
+def code_counts(column: str) -> pd.Series:
+    """Incidents per precinct, district or zip code, the most frequent first, by label.
+
+    The codes were read as numbers when the data was loaded (see
+    `clean_and_filter_data`), so they are only counted and labelled here. An
+    incident without a valid code has none to be counted under.
+    """
+    counts = df_filtered[column].value_counts()
+    counts.index = code_labels(counts.index, CODE_LABEL_PREFIXES[column])
+    return counts
+
+
 # ── Row 1: Neighborhoods + Precincts ────────────────────────────────────────
 left, right = st.columns(2)
 
@@ -57,8 +69,7 @@ with left:
 with right:
     # Every precinct, not a top 10: there are 11, so one would always be left out
     st.subheader("Police Precincts")
-    precincts = format_categorical_series(df_filtered["police_precinct"], "Precinct")
-    bar_chart(precincts.value_counts(), "Precinct", AMBER_ACCENT)
+    bar_chart(code_counts("police_precinct"), "Precinct", AMBER_ACCENT)
 
 
 # ── Row 2: Districts + Zip Codes ─────────────────────────────────────────────
@@ -67,14 +78,11 @@ left2, right2 = st.columns(2)
 with left2:
     # Every district as well: there are 7
     st.subheader("Council Districts")
-    districts = format_categorical_series(df_filtered["council_district"], "District")
-    bar_chart(districts.value_counts(), "District", RED_ACCENT)
+    bar_chart(code_counts("council_district"), "District", RED_ACCENT)
 
 with right2:
     st.subheader(f"Top {TOP_N_ITEMS} Zip Codes")
-    zip_codes = format_categorical_series(df_filtered["zip_code"])
-    counts = zip_codes.value_counts().head(TOP_N_ITEMS)
-    bar_chart(counts, "Zip Code", AMBER_ACCENT)
+    bar_chart(code_counts("zip_code").head(TOP_N_ITEMS), "Zip Code", AMBER_ACCENT)
 
 
 # ── Row 3: Top Locations (full width) ────────────────────────────────────────
