@@ -199,10 +199,18 @@ if mode == "Scatter":
     # Build a compact CSS legend
     visible_cats = sorted(df_map["offense_category"].dropna().unique())
     legend_entries = [(cat, color_map[cat]) for cat in visible_cats if cat in color_map]
+    # Everything drawn in the shared grey gets one entry that says what it is:
+    # the categories beyond the palette, and incidents with no category at all
+    # (the tooltip calls those "Unknown")
+    grey = []
     other_count = sum(1 for cat in visible_cats if cat not in color_map)
     if other_count:
         noun = "category" if other_count == 1 else "categories"
-        legend_entries.append((f"Other ({other_count} {noun})", OTHER_COLOR))
+        grey.append(f"Other ({other_count} {noun})")
+    if df_map["offense_category"].isna().any():
+        grey.append("Unknown")
+    if grey:
+        legend_entries.append((" and ".join(grey), OTHER_COLOR))
 
     legend_items = []
     for label, (r, g, b) in legend_entries:

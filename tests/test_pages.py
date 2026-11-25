@@ -2,6 +2,7 @@
 
 import base64
 import json
+import threading
 from datetime import timedelta
 from pathlib import Path
 
@@ -10,14 +11,19 @@ import pandas as pd
 import pytest
 import requests
 import streamlit as st
+from streamlit.proto.Metric_pb2 import Metric as MetricProto
 from streamlit.testing.v1 import AppTest
 
 import utils
-from conftest import clean_feed, make_page_state
+from conftest import clean_feed, make_page_state, make_raw_feed
 from constants import DAY_LABELS, MAX_SCATTER_POINTS
 
 ROOT = Path(__file__).resolve().parent.parent
 TIMEOUT = 300  # the Trends page fits a Prophet model
+
+# What a page says while it waits for a download to end
+REFRESHING_NOTE = "Newer data is being downloaded. This page will update when it is ready."
+RETRY_NOTE = "The download will be tried again shortly, and this page will update by itself."
 
 
 def run_page(name: str, state: dict) -> AppTest:
@@ -41,6 +47,23 @@ def run_app(feed: pd.DataFrame, monkeypatch) -> AppTest:
     at.run()
     assert not at.exception, at.exception
     return at
+
+
+def held_back(result):
+    """A download that does not end until it is let go.
+
+    Returns the stand-in for the download and the Event that releases it.
+    `result` is the raw feed it then returns, or the exception it raises.
+    """
+    release = threading.Event()
+
+    def download(url, **kwargs):
+        release.wait(timeout=TIMEOUT)
+        if isinstance(result, Exception):
+            raise result
+        return result.copy()
+
+    return download, release
 
 
 def plotly_figures(at: AppTest) -> list[dict]:
@@ -190,6 +213,36 @@ def test_current_year_keeps_its_change_from_last_year(overview):
     assert not past_year["Total Incidents"] and not past_year["Avg Daily"]
 
 
+def test_no_change_from_last_year_unless_the_data_covers_it_from_its_first_day(monkeypatch):
+    # The same 8 incidents a day throughout, in a feed that starts on 15
+    # February last year. Its 44 days up to 30 March, set against this year's
+    # 89, would show as crime having doubled.
+    at = run_app(make_raw_feed(start="2025-02-15"), monkeypatch)
+    metrics = {m.label: m for m in at.metric}
+    assert not metrics["Total Incidents"].delta and not metrics["Avg Daily"].delta
+    assert "The change compares this year" not in metrics["Total Incidents"].help
+
+
+def test_change_that_rounds_to_nothing_is_not_drawn_as_a_rise(overview):
+    # The same number of incidents as in the same days of last year
+    for label in ("Total Incidents", "Avg Daily"):
+        metric = {m.label: m for m in overview.metric}[label]
+        assert metric.delta == "0.0%"
+        assert metric.proto.direction == MetricProto.MetricDirection.NONE
+        assert metric.proto.color == MetricProto.MetricColor.GRAY
+
+
+def test_rise_from_last_year_is_drawn_as_bad_news(raw_feed, monkeypatch):
+    # Ten days fewer of last year's incidents: this year's count is the higher
+    fewer_last_year = raw_feed[~raw_feed["incident_occurred_at"].str.startswith("2025/02/1")]
+    at = run_app(fewer_last_year, monkeypatch)
+    for label in ("Total Incidents", "Avg Daily"):
+        metric = {m.label: m for m in at.metric}[label]
+        assert metric.delta.startswith("+")
+        assert metric.proto.direction == MetricProto.MetricDirection.UP
+        assert metric.proto.color == MetricProto.MetricColor.RED
+
+
 def test_top_descriptions_are_not_split_by_padding(overview):
     overview.sidebar.selectbox[0].select("CATEGORY 01").run()
     assert not overview.exception
@@ -250,6 +303,66 @@ def test_first_load_failure_is_reported(monkeypatch):
         "Connection failed. Please check your internet connection and try again."
     ]
     assert not at.metric
+    # A fault on the line can pass: the page says it will look again by itself
+    assert [c.value for c in at.caption] == [RETRY_NOTE]
+
+
+def test_passing_first_load_failure_is_tried_again_without_a_reload(raw_feed, monkeypatch):
+    # No wait before another try, so the page is at once due to look again
+    import constants
+
+    monkeypatch.setattr(constants, "DATA_FIRST_LOAD_RETRY_INTERVAL", 0)
+    monkeypatch.setattr(utils, "DATA_FIRST_LOAD_RETRY_INTERVAL", 0)
+    downloads = []
+
+    def down_then_up(url, **kwargs):
+        downloads.append(url)
+        if len(downloads) == 1:
+            raise requests.exceptions.ConnectionError("portal down")
+        return raw_feed.copy()
+
+    monkeypatch.setattr(utils, "safe_load_data_from_url", down_then_up)
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
+    at.run()
+
+    # One run from the visitor: the page went back for the data by itself
+    assert not at.exception, at.exception
+    assert len(downloads) == 2
+    assert not at.error and not at.caption
+    assert at.metric
+
+
+def test_dataset_that_has_moved_is_not_reported_as_a_passing_fault(monkeypatch):
+    def not_found(url, **kwargs):
+        response = requests.Response()
+        response.status_code = 404
+        raise requests.exceptions.HTTPError("404 Client Error: Not Found for url: https://example.invalid/feed.csv", response=response)
+
+    monkeypatch.setattr(utils, "safe_load_data_from_url", not_found)
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
+    at.run()
+    assert [e.value for e in at.error] == [
+        "The data portal would not serve the dataset: 404 Client Error: Not Found for url: "
+        "https://example.invalid/feed.csv. It may have been moved or withdrawn, in which case "
+        "the address the app downloads from needs updating."
+    ]
+    # It would say the same on every try, so the page does not go on asking
+    assert not at.caption
+
+
+def test_server_fault_is_reported_as_one_that_may_pass(monkeypatch):
+    def unavailable(url, **kwargs):
+        response = requests.Response()
+        response.status_code = 503
+        raise requests.exceptions.HTTPError("503 Server Error: Service Unavailable", response=response)
+
+    monkeypatch.setattr(utils, "safe_load_data_from_url", unavailable)
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
+    at.run()
+    assert [e.value for e in at.error] == [
+        "Server error: 503 Server Error: Service Unavailable. The data source may be temporarily unavailable."
+    ]
+    assert [c.value for c in at.caption] == [RETRY_NOTE]
 
 
 def test_failed_first_load_is_not_repeated_by_the_next_rerun(monkeypatch):
@@ -282,16 +395,20 @@ def test_download_cut_short_is_reported_in_plain_words(monkeypatch):
 
 
 def test_failed_refresh_keeps_showing_the_last_data(overview, monkeypatch):
-    # The data is due for a refresh, and the portal is down
-    monkeypatch.setattr(utils, "safe_load_data_from_url", portal_down)
+    # The data is due for a refresh, and the portal is down (it takes a while to say so)
+    download, release = held_back(requests.exceptions.ConnectionError("portal down"))
+    monkeypatch.setattr(utils, "safe_load_data_from_url", download)
     utils.dataset_cache().expire()
 
-    # The refresh runs behind the page, which shows the data it has without waiting
+    # The refresh runs behind the page, which shows the data it has without
+    # waiting, and says that newer data is on its way
     overview.run()
     assert not overview.exception and not overview.error and not overview.warning
+    assert [c.value for c in overview.caption] == [REFRESHING_NOTE]
     assert {m.label for m in overview.metric} >= {"Total Incidents", "Avg Daily"}
 
     # Once the refresh has failed the next run says so, and still shows the data
+    release.set()
     assert utils.dataset_cache().wait(timeout=TIMEOUT)
     overview.run()
     assert not overview.exception and not overview.error
@@ -299,26 +416,105 @@ def test_failed_refresh_keeps_showing_the_last_data(overview, monkeypatch):
         "The data could not be refreshed, so the last copy that loaded is shown. "
         "Connection failed. Please check your internet connection and try again."
     ]
+    assert not overview.caption  # nothing is being downloaded any more
     assert {m.label for m in overview.metric} >= {"Total Incidents", "Avg Daily"}
 
 
 def test_refreshed_data_is_shown_on_the_run_after_it_arrives(overview, raw_feed, monkeypatch):
     # The feed has lost its last month by the time the data is due for a refresh
     shorter = raw_feed[raw_feed["incident_occurred_at"] < "2026/03/01"]
-    monkeypatch.setattr(utils, "safe_load_data_from_url", lambda url, **kwargs: shorter.copy())
+    download, release = held_back(shorter)
+    monkeypatch.setattr(utils, "safe_load_data_from_url", download)
     before = {m.label: m.value for m in overview.metric}["Total Incidents"]
     utils.dataset_cache().expire()
 
     overview.run()
     assert {m.label: m.value for m in overview.metric}["Total Incidents"] == before
+    assert [c.value for c in overview.caption] == [REFRESHING_NOTE]
 
+    release.set()
     assert utils.dataset_cache().wait(timeout=TIMEOUT)
     overview.run()
-    assert not overview.exception and not overview.warning
+    assert not overview.exception and not overview.warning and not overview.caption
     assert {m.label: m.value for m in overview.metric}["Total Incidents"] != before
 
 
-def test_filters_are_kept_when_a_refresh_changes_their_options(overview, raw_feed, monkeypatch):
+class WaitingCache:
+    """Stands in for the dataset cache while a refresh is said to be running.
+
+    `still_running` is what it answers, in turn, each time it is asked whether
+    the refresh is still under way; after that the refresh has ended.
+    """
+
+    def __init__(self, df: pd.DataFrame, still_running: list[bool]):
+        self.df = df
+        self.still_running = still_running
+        self.gets = 0
+
+    def get(self, loader):
+        self.gets += 1
+        return self.df, None
+
+    def wait(self, timeout=None) -> bool:
+        return not (self.still_running.pop(0) if self.still_running else False)
+
+
+def test_page_is_drawn_again_when_the_refresh_it_waits_for_has_ended(clean_df, monkeypatch):
+    # Running when the page starts, over by the time the page asks again. An
+    # open page asks every few seconds; here it is on its first time of asking.
+    cache = WaitingCache(clean_df, still_running=[True, False])
+    monkeypatch.setattr(utils, "dataset_cache", lambda: cache)
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
+    at.run()
+
+    assert not at.exception, at.exception
+    # The page went back for the data and drew itself again, with nothing left to wait for
+    assert cache.gets == 2
+    assert not at.caption
+    assert at.metric
+
+
+def test_page_waiting_for_a_refresh_is_not_drawn_again_before_it_ends(clean_df, monkeypatch):
+    cache = WaitingCache(clean_df, still_running=[True, True])
+    monkeypatch.setattr(utils, "dataset_cache", lambda: cache)
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
+    at.run()
+
+    assert not at.exception, at.exception
+    assert cache.gets == 1
+    assert [c.value for c in at.caption] == [REFRESHING_NOTE]
+    assert at.metric
+
+
+def test_refresh_that_has_lost_most_of_its_incidents_is_refused(overview, raw_feed, monkeypatch):
+    before = {m.label: m.value for m in overview.metric}
+
+    # Nine in ten rows come back without coordinates, as after a geocoding fault
+    gutted = raw_feed.copy()
+    lost = gutted.sample(frac=0.9, random_state=1).index
+    gutted.loc[lost, ["latitude", "longitude"]] = np.nan
+    monkeypatch.setattr(utils, "safe_load_data_from_url", lambda url, **kwargs: gutted.copy())
+    utils.dataset_cache().expire()
+    overview.run()
+    assert utils.dataset_cache().wait(timeout=TIMEOUT)
+    overview.run()
+    assert not overview.exception and not overview.error
+
+    # The copy in use is kept, and the page says why the new one was not taken
+    assert {m.label: m.value for m in overview.metric} == before
+    [warning] = [w.value for w in overview.warning]
+    assert warning.startswith(
+        "The data could not be refreshed, so the last copy that loaded is shown. "
+        "Data validation error: the refreshed feed has only "
+    )
+    assert f"against {before['Total Incidents']} in the copy shown" in warning
+
+
+def test_filters_are_kept_when_a_refresh_changes_their_options(raw_feed, monkeypatch):
+    # A feed with only the last month of 2024 (local midnight on 1 Dec is 05:00 UTC)
+    first = raw_feed[raw_feed["incident_occurred_at"] >= "2024/12/01 05:00:00+00"]
+    overview = run_app(first, monkeypatch)
+    assert overview.sidebar.selectbox[1].options == ["All", "2024", "2025", "2026"]
     overview.sidebar.selectbox[0].select("CATEGORY 03").run()
     overview.sidebar.selectbox[1].select(2025).run()
     before = {m.label: m.value for m in overview.metric}["Total Incidents"]
@@ -344,11 +540,12 @@ def test_filters_are_kept_when_a_refresh_changes_their_options(overview, raw_fee
 
 
 def test_filter_that_is_no_longer_offered_falls_back_to_all(overview, raw_feed, monkeypatch):
-    overview.sidebar.selectbox[0].select("CATEGORY 03").run()
+    overview.sidebar.selectbox[0].select("CATEGORY 12").run()
     overview.sidebar.selectbox[1].select(2025).run()
 
-    # The category has gone from the refreshed feed
-    without = raw_feed[raw_feed["offense_category"] != "CATEGORY 03"]
+    # The category has gone from the refreshed feed (one in twenty incidents:
+    # a feed that had lost many more would be refused as incomplete)
+    without = raw_feed[raw_feed["offense_category"] != "CATEGORY 12"]
     monkeypatch.setattr(utils, "safe_load_data_from_url", lambda url, **kwargs: without.copy())
     utils.dataset_cache().expire()
     overview.run()
@@ -357,7 +554,7 @@ def test_filter_that_is_no_longer_offered_falls_back_to_all(overview, raw_feed, 
     assert not overview.exception
 
     category, year = overview.sidebar.selectbox
-    assert "CATEGORY 03" not in category.options
+    assert "CATEGORY 12" not in category.options
     assert (category.value, year.value) == ("All", 2025)
     in_2025 = clean_feed(without)["incident_year"] == 2025
     assert {m.label: m.value for m in overview.metric}["Total Incidents"] == f"{in_2025.sum():,}"
@@ -373,6 +570,9 @@ def test_feed_with_no_usable_rows_is_an_error_and_is_not_kept(raw_feed, monkeypa
         "the dates or coordinates in the feed may have changed"
     ]
     assert not at.metric
+    # The same feed would fail the same way, at the cost of a whole download
+    # each time: the page does not try again by itself
+    assert not at.caption
 
     # Nothing was cached: once the feed is right again, and the wait before
     # another try is over, the next run loads it
@@ -397,7 +597,8 @@ def test_trends_heatmap_labels_days_iso(page_state):
     # Daily, year over year, heatmap and the forecast all rendered
     assert len(figures) == 4
     assert not at.error
-    assert not at.caption  # the note about the Year filter is only shown with one
+    # The note about the Year filter is only shown with one
+    assert not any("Year filter" in c.value for c in at.caption)
 
 
 def test_heatmap_always_shows_the_full_week_and_day(clean_df):
@@ -487,8 +688,51 @@ def test_trends_projection_starts_from_last_day_of_data(page_state, clean_df):
 
     as_of = page_state["data_end_date"]
     current = int((clean_df["incident_year"] == as_of.year).sum())
-    expected_total = utils.project_full_year(current, as_of)
+    expected_total = utils.project_full_year(current, as_of, page_state["data_start_date"])
     assert projected["base"][0] + projected["y"][0] == pytest.approx(expected_total)
+
+
+def test_part_years_are_marked_on_the_year_over_year_chart(page_state):
+    # The data runs from 1 June 2024 to 30 March 2026: only 2025 is a whole year
+    at = run_page("2_Trends.py", page_state)
+    yoy = next(f for f in plotly_figures(at) if f["data"][0]["type"] == "bar")
+    bars = yoy["data"][0]
+    assert values(bars["x"]) == [2024, 2025, 2026]
+    assert values(bars["marker"]["opacity"]) == [0.45, 1, 0.45]
+    assert [c.value for c in at.caption] == [
+        "Lighter bars cover part of a year: 2024 (from 1 Jun), 2026 (to 30 Mar)."
+    ]
+
+    # A whole year on its own is neither lighter nor explained
+    at = run_page("2_Trends.py", make_page_state(page_state["df_all_years"], year=2025))
+    yoy = next(f for f in plotly_figures(at) if f["data"][0]["type"] == "bar")
+    assert values(yoy["data"][0]["marker"]["opacity"]) == [1]
+    assert not any("Lighter bars" in c.value for c in at.caption)
+
+
+def test_current_year_is_marked_as_part_of_one_before_it_is_projected():
+    # 40 days into the year there is no projection yet. The bar is a ninth of
+    # last year's, and the page says that it only runs to 9 February.
+    df = clean_feed(make_raw_feed(end="2026-02-10 23:00"))
+    at = run_page("2_Trends.py", make_page_state(df))
+    yoy = next(f for f in plotly_figures(at) if f["data"][0]["type"] == "bar")
+    [bars] = yoy["data"]  # no "Projected" bar on top of it
+    assert values(bars["x"]) == [2024, 2025, 2026]
+    assert values(bars["marker"]["opacity"]) == [0.45, 1, 0.45]
+    assert [c.value for c in at.caption] == [
+        "Lighter bars cover part of a year: 2024 (from 1 Jun), 2026 (to 9 Feb)."
+    ]
+
+
+def test_projection_counts_from_the_first_day_of_data():
+    # The data starts on 1 February of the current year: at 8 a day the year
+    # comes to 2,920, not to the 2,417 of a count taken to run from 1 January
+    df = clean_feed(make_raw_feed(start="2026-02-01", end="2026-06-30 23:00"))
+    at = run_page("2_Trends.py", make_page_state(df))
+    yoy = next(f for f in plotly_figures(at) if f["data"][0]["type"] == "bar")
+    actual, projected = yoy["data"]
+    assert projected["base"][0] + projected["y"][0] == pytest.approx(8 * 365)
+    assert [c.value for c in at.caption] == ["Lighter bars cover part of a year: 2026 (1 Feb to 29 Jun)."]
 
 
 def test_forecast_failure_is_reported_and_not_cached(page_state, monkeypatch):
@@ -656,6 +900,27 @@ def test_map_colors_are_unique_and_stable(page_state, clean_df):
     category = page_state["category_order"][3]
     only = dict(page_state, df_filtered=clean_df[clean_df["offense_category"] == category])
     assert legend_colors(run_page("5_Map.py", only)) == {category: everything[category]}
+
+
+def test_map_legend_names_what_the_grey_points_are(page_state, clean_df):
+    # Five incidents have no category: they are drawn in the grey that the
+    # categories beyond the palette share, and the legend says so
+    no_category = clean_df.index.isin(clean_df.index[:5])
+    some_unknown = clean_df.assign(offense_category=clean_df["offense_category"].mask(no_category))
+    legend = legend_colors(run_page("5_Map.py", dict(page_state, df_filtered=some_unknown)))
+    assert "Other (5 categories) and Unknown" in legend
+    assert len(legend) == 16 and len(set(legend.values())) == 16
+
+    # A selection within the palette: the grey is there for the unknown ones alone
+    category = page_state["category_order"][0]
+    selection = some_unknown[no_category | (some_unknown["offense_category"] == category)]
+    legend = legend_colors(run_page("5_Map.py", dict(page_state, df_filtered=selection)))
+    assert list(legend) == [category, "Unknown"]
+    assert legend["Unknown"] == "rgb(140,150,165)"
+
+    # The grey points carry that name in their tooltip
+    points = deck_spec(run_page("5_Map.py", dict(page_state, df_filtered=selection)))["layers"][0]["data"]
+    assert {(p["r"], p["g"], p["b"]) for p in points if p["category"] == "Unknown"} == {(140, 150, 165)}
 
 
 def test_map_scatter_payload(page_state, clean_df):

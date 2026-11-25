@@ -16,8 +16,9 @@ from constants import REQUIRED_COLUMNS
 from theme import BLUE_ACCENT, RED_ACCENT, apply_dark_plotly
 from utils import (
     DataNotReadyError, LoadFailedError, RefreshingCache, clean_and_filter_data, code_labels,
-    compute_yoy_deltas, daily_incident_counts, day_labels, format_categorical_series, numeric_codes,
-    project_full_year, safe_load_data_from_url, same_day_last_year, selection_period,
+    compute_yoy_deltas, daily_incident_counts, day_labels, format_categorical_series, format_change,
+    numeric_codes, part_year_note, partial_years, project_full_year, refuse_shrunken_refresh,
+    safe_load_data_from_url, same_day_last_year, selection_period,
 )
 
 BOUNDS = ((42.0, 43.0), (-84.0, -82.0))
@@ -235,11 +236,46 @@ class TestPeriods:
 
 
 class TestYearOverYear:
+    # First day of a dataset that reaches back well before the years compared
+    START = date(2018, 1, 1)
+
     def test_projection_uses_days_of_data(self):
         # 59 days of data at 10 a day projects to a full year at the same rate
-        assert project_full_year(590, date(2025, 2, 28)) is None  # under 60 days
-        assert project_full_year(600, date(2025, 3, 1)) == pytest.approx(10 * 365)
-        assert project_full_year(600, date(2024, 2, 29)) == pytest.approx(10 * 366)
+        assert project_full_year(590, date(2025, 2, 28), self.START) is None  # under 60 days
+        assert project_full_year(600, date(2025, 3, 1), self.START) == pytest.approx(10 * 365)
+        assert project_full_year(600, date(2024, 2, 29), self.START) == pytest.approx(10 * 366)
+
+    def test_projection_counts_only_the_days_the_data_covers(self):
+        # The data starts on 1 February: 149 days at 8 a day by 29 June. Scaled
+        # from 1 January, as 180 days, this would come to 2,417 for the year.
+        assert project_full_year(1192, date(2026, 6, 29), date(2026, 2, 1)) == pytest.approx(8 * 365)
+        # The 60 days needed are days of data, not days of the year
+        assert project_full_year(480, date(2026, 6, 29), date(2026, 5, 1)) == pytest.approx(8 * 365)
+        assert project_full_year(472, date(2026, 6, 29), date(2026, 5, 2)) is None
+
+    def test_years_covered_in_part(self):
+        # First and last year of a dataset that starts in June and ends in March
+        assert partial_years(date(2024, 6, 1), date(2026, 3, 30)) == {
+            2024: (date(2024, 6, 1), date(2024, 12, 31)),
+            2026: (date(2026, 1, 1), date(2026, 3, 30)),
+        }
+        # Whole years are not listed, and a dataset within one year lists it once
+        assert partial_years(date(2018, 1, 1), date(2026, 12, 31)) == {}
+        assert partial_years(date(2018, 1, 1), date(2026, 2, 9)) == {2026: (date(2026, 1, 1), date(2026, 2, 9))}
+        assert partial_years(date(2026, 2, 1), date(2026, 6, 29)) == {2026: (date(2026, 2, 1), date(2026, 6, 29))}
+
+    def test_part_of_a_year_in_a_few_words(self):
+        assert part_year_note(date(2026, 1, 1), date(2026, 2, 9)) == "to 9 Feb"
+        assert part_year_note(date(2024, 6, 1), date(2024, 12, 31)) == "from 1 Jun"
+        assert part_year_note(date(2026, 2, 1), date(2026, 6, 29)) == "1 Feb to 29 Jun"
+
+    def test_change_that_rounds_to_zero_has_no_sign(self):
+        assert format_change(0.042) == "+4.2%"
+        assert format_change(-0.003) == "-0.3%"
+        assert format_change(1.0) == "+100.0%"
+        # "+0.0%" would be drawn as a rise and "-0.0%" as a fall
+        assert format_change(0.0) == format_change(0.0004) == format_change(-0.0004) == "0.0%"
+        assert format_change(0.0006) == "+0.1%"
 
     @staticmethod
     def yearly(prior_dates, current_dates) -> pd.DataFrame:
@@ -249,9 +285,9 @@ class TestYearOverYear:
     def test_flat_year_shows_no_change_whatever_today_is(self):
         prior = pd.date_range("2025-01-01", "2025-12-31", freq="D")
         current = pd.date_range("2026-01-01", "2026-03-06", freq="D")  # data ends 6 Mar
-        incidents, avg = compute_yoy_deltas(self.yearly(prior, current), date(2026, 3, 6))
-        assert incidents == "+0.0%"
-        assert avg == "+0.0%"
+        incidents, avg = compute_yoy_deltas(self.yearly(prior, current), date(2026, 3, 6), self.START)
+        assert incidents == "0.0%"
+        assert avg == "0.0%"
 
     def test_seasons_are_not_taken_for_a_change(self):
         # Two identical years, quiet from December to March. Measured against
@@ -261,25 +297,25 @@ class TestYearOverYear:
             return [day for day in days for _ in range(3 if day.month in (12, 1, 2, 3) else 5)]
 
         frame = self.yearly(year(2025, "2025-12-31"), year(2026, "2026-03-31"))
-        assert compute_yoy_deltas(frame, date(2026, 3, 31)) == ("+0.0%", "+0.0%")
+        assert compute_yoy_deltas(frame, date(2026, 3, 31), self.START) == ("0.0%", "0.0%")
 
     def test_only_the_same_days_of_last_year_are_compared(self):
         # Last year: 10 incidents by the end of March, then 100 in November
         prior = ["2025-02-10"] * 10 + ["2025-11-05"] * 100
         current = ["2026-02-10"] * 20
-        assert compute_yoy_deltas(self.yearly(prior, current), date(2026, 3, 31)) == ("+100.0%", "+100.0%")
+        assert compute_yoy_deltas(self.yearly(prior, current), date(2026, 3, 31), self.START) == ("+100.0%", "+100.0%")
 
     def test_last_day_of_data_is_counted_in_both_years(self):
         # An incident late on the last day, and one on the same day last year
         prior = ["2025-03-31 23:30"] * 4 + ["2025-04-01 00:10"]
         current = ["2026-03-31 23:30"] * 5
-        assert compute_yoy_deltas(self.yearly(prior, current), date(2026, 3, 31)) == ("+25.0%", "+25.0%")
+        assert compute_yoy_deltas(self.yearly(prior, current), date(2026, 3, 31), self.START) == ("+25.0%", "+25.0%")
 
     def test_sparse_prior_year_deltas_agree(self):
         # 2 incidents on consecutive days last year, 20 by day 300 this year
         prior = ["2025-03-03", "2025-03-04"]
         current = pd.date_range("2026-01-01", periods=20, freq="15D")
-        incidents, avg = compute_yoy_deltas(self.yearly(prior, current), date(2026, 10, 27))
+        incidents, avg = compute_yoy_deltas(self.yearly(prior, current), date(2026, 10, 27), self.START)
         assert incidents == avg == "+900.0%"
 
     def test_leap_day_counts_in_the_total_but_not_in_the_daily_average(self):
@@ -289,16 +325,29 @@ class TestYearOverYear:
         assert same_day_last_year(date(2028, 2, 29)) == date(2027, 2, 28)
         assert same_day_last_year(date(2028, 3, 1)) == date(2027, 3, 1)
         # 60 days against 59
-        assert compute_yoy_deltas(self.yearly(prior, current), date(2028, 2, 29)) == ("+1.7%", "+0.0%")
+        assert compute_yoy_deltas(self.yearly(prior, current), date(2028, 2, 29), self.START) == ("+1.7%", "0.0%")
 
     def test_no_delta_without_both_years(self):
         current = pd.date_range("2026-01-01", "2026-06-30", freq="D")
-        assert compute_yoy_deltas(self.yearly([], current), date(2026, 6, 30)) == (None, None)
+        assert compute_yoy_deltas(self.yearly([], current), date(2026, 6, 30), self.START) == (None, None)
 
     def test_no_delta_until_enough_of_the_year_has_data(self):
         prior = pd.date_range("2025-01-01", "2025-12-31", freq="D")
         current = pd.date_range("2026-01-01", "2026-02-28", freq="D")  # 59 days
-        assert compute_yoy_deltas(self.yearly(prior, current), date(2026, 2, 28)) == (None, None)
+        assert compute_yoy_deltas(self.yearly(prior, current), date(2026, 2, 28), self.START) == (None, None)
+
+    def test_no_delta_unless_the_data_covers_last_year_from_its_first_day(self):
+        # One incident a day from 15 February last year. Its 44 days up to 30
+        # March would be set against this year's 89, and show as a doubling.
+        prior = pd.date_range("2025-02-15", "2025-12-31", freq="D")
+        current = pd.date_range("2026-01-01", "2026-03-30", freq="D")
+        frame = self.yearly(prior, current)
+        assert compute_yoy_deltas(frame, date(2026, 3, 30), date(2025, 2, 15)) == (None, None)
+        assert compute_yoy_deltas(frame, date(2026, 3, 30), date(2025, 1, 2)) == (None, None)
+        # A dataset that starts on 1 January of last year, or before, is compared
+        whole_prior = pd.date_range("2025-01-01", "2025-12-31", freq="D")
+        frame = self.yearly(whole_prior, current)
+        assert compute_yoy_deltas(frame, date(2026, 3, 30), date(2025, 1, 1)) == ("0.0%", "0.0%")
 
 
 class TestCategoricalFormatting:
@@ -715,6 +764,59 @@ class TestRefreshingCache:
         assert "ValueError: the feed changed" in caplog.text
         assert "in failing_load" in caplog.text
 
+    def test_refresh_that_fails_its_check_is_refused(self, clock):
+        compared = []
+
+        def check(new, previous):
+            compared.append((new, previous))
+            if new == "half of it":
+                raise ValueError("too little")
+
+        cache = RefreshingCache(ttl=100, retry_interval=10, clock=clock, check=check)
+        load = loader("first", "half of it", "second")
+        # A first load has nothing to be compared with
+        assert cache.get(load) == ("first", None)
+        assert compared == []
+
+        # The refused refresh is a failed one: the value in use stays, with the reason
+        clock.now += 100
+        cache.get(load)
+        assert cache.wait(timeout=5)
+        value, error = cache.get(load)
+        assert (value, str(error)) == ("first", "too little")
+        assert compared == [("half of it", "first")]
+
+        # The next refresh is checked against the value in use, and taken
+        clock.now += 10
+        cache.get(load)
+        assert cache.wait(timeout=5)
+        assert cache.get(load) == ("second", None)
+        assert compared[-1] == ("second", "first")
+
+    def test_refused_refresh_is_not_kept_in_memory(self, clock):
+        class Download:
+            """Stands in for a dataset."""
+
+        def check(new, previous):
+            raise ValueError("too little")
+
+        cache = RefreshingCache(ttl=100, retry_interval=10, clock=clock, check=check)
+        refused = []
+
+        def refresh():
+            download = Download()
+            refused.append(weakref.ref(download))
+            return download
+
+        cache.get(loader("first"))
+        cache.expire()
+        cache.get(refresh)
+        assert cache.wait(timeout=5)
+        value, error = cache.get(loader())
+        gc.collect()
+        assert (value, str(error)) == ("first", "too little")
+        assert refused[0]() is None
+
     def test_expire_makes_the_next_get_refresh(self, cache):
         load = loader("first", "second")
         cache.get(load)
@@ -722,6 +824,35 @@ class TestRefreshingCache:
         assert cache.get(load) == ("first", None)
         assert cache.wait(timeout=5)
         assert cache.get(load) == ("second", None)
+
+
+class TestShrunkenRefresh:
+    @staticmethod
+    def rows(count: int) -> pd.DataFrame:
+        return pd.DataFrame({"latitude": [42.33] * count})
+
+    def test_refresh_that_grows_or_loses_a_little_is_taken(self):
+        refuse_shrunken_refresh(self.rows(1010), self.rows(1000))
+        refuse_shrunken_refresh(self.rows(1000), self.rows(1000))
+        refuse_shrunken_refresh(self.rows(900), self.rows(1000))
+
+    def test_refresh_that_has_lost_much_of_its_rows_is_refused(self):
+        with pytest.raises(ValueError, match="only 899 usable incidents, against 1,000 in the copy shown"):
+            refuse_shrunken_refresh(self.rows(899), self.rows(1000))
+
+    def test_dataset_cache_checks_its_refreshes(self):
+        utils.st.cache_resource.clear()
+        try:
+            cache = utils.dataset_cache()
+            assert len(cache.get(lambda: self.rows(1000))[0]) == 1000
+            cache.expire()
+            cache.get(lambda: self.rows(100))
+            assert cache.wait(timeout=5)
+            value, error = cache.get(lambda: self.rows(100))
+            assert len(value) == 1000
+            assert "only 100 usable incidents" in str(error)
+        finally:
+            utils.st.cache_resource.clear()
 
 
 class TestAccentColors:

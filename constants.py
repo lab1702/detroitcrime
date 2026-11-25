@@ -47,6 +47,11 @@ MAX_UNPARSEABLE_DATE_SHARE = 0.01
 # incomplete; a lone mistyped row dated later does not count as a day.
 MIN_LAST_DAY_SHARE = 0.1
 
+# A refresh is refused, and the copy in use kept, if it has fewer than this
+# share of that copy's incidents: the feed grows from day to day, so one that
+# has shrunk this much is a short export or has lost its coordinates.
+MIN_REFRESH_ROW_SHARE = 0.9
+
 # Cache settings (in seconds)
 DATA_CACHE_TTL = 86400  # 24 hours
 # After a failed refresh the previous data stays in use; wait this long before
@@ -55,6 +60,9 @@ DATA_RETRY_INTERVAL = 900  # 15 minutes
 # A failed first load leaves nothing to show, so it is tried again sooner.
 # Until then every visitor is shown the failure rather than repeating the download.
 DATA_FIRST_LOAD_RETRY_INTERVAL = 60  # 1 minute
+# How often an open page that is waiting for a download asks whether it has
+# ended, so that it can show the result without the user clicking anything.
+DATA_POLL_INTERVAL = 5
 FORECAST_CACHE_TTL = 3600  # 1 hour
 YOY_CACHE_TTL = 1800  # 30 minutes
 

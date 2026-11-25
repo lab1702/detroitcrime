@@ -20,7 +20,7 @@ import streamlit as st
 from constants import (
     DATA_CACHE_TTL, DATA_FIRST_LOAD_RETRY_INTERVAL, DATA_RETRY_INTERVAL, DAY_LABELS,
     LOCAL_TIMEZONE, MAX_UNPARSEABLE_DATE_SHARE, MIN_LAST_DAY_SHARE, MIN_PROJECTION_DAYS,
-    NUMBER_COLUMNS, REQUIRED_COLUMNS, TEXT_COLUMNS,
+    MIN_REFRESH_ROW_SHARE, NUMBER_COLUMNS, REQUIRED_COLUMNS, TEXT_COLUMNS,
 )
 
 logger = logging.getLogger(__name__)
@@ -290,15 +290,21 @@ class RefreshingCache:
             nothing to show and so is usually tried again sooner. Defaults to
             `retry_interval`.
         clock: Source of the current time, in seconds
+        check: Called on the cache's thread with (new value, value in use)
+            when a refresh has loaded. If it raises, the new value is refused
+            and the refresh counts as failed. A first load has nothing to be
+            compared with, so it is not checked.
     """
 
     def __init__(self, ttl: float, retry_interval: float,
                  first_retry_interval: Optional[float] = None,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic,
+                 check: Optional[Callable[[Any, Any], None]] = None) -> None:
         self._ttl = ttl
         self._retry_interval = retry_interval
         self._first_retry_interval = retry_interval if first_retry_interval is None else first_retry_interval
         self._clock = clock
+        self._check = check
         # Guards the fields below. It is never held while a load runs.
         self._lock = threading.Lock()
         self._has_value = False
@@ -358,7 +364,10 @@ class RefreshingCache:
         """Run one load on the cache's thread and record how it ended."""
         try:
             try:
-                load.value = loader()
+                # Handed straight on, not kept in a variable here: this frame
+                # is still running when a failure is logged, so a record of
+                # that failure would keep a refused value alive through it
+                load.value = self._checked(loader())
             except BaseException as error:  # whatever stops the load is its outcome
                 load.error = error
                 # The pages only show the message. This is the one record of
@@ -382,6 +391,20 @@ class RefreshingCache:
             finally:
                 load.done.set()
 
+    def _checked(self, value: Any) -> Any:
+        """Return a newly loaded value once `check` has passed it.
+
+        It is put to `check` against the value in use. With none in use (a
+        first load) there is nothing to compare it with, and it is returned
+        as it is.
+        """
+        if self._check is not None:
+            with self._lock:
+                has_previous, previous = self._has_value, self._value
+            if has_previous:
+                self._check(value, previous)
+        return value
+
     def wait(self, timeout: Optional[float] = None) -> bool:
         """Wait for the load under way, if there is one, to end.
 
@@ -402,6 +425,27 @@ class RefreshingCache:
             self._failed_at = None
 
 
+def refuse_shrunken_refresh(new: pd.DataFrame, previous: pd.DataFrame) -> None:
+    """Refuse a refreshed dataset that has lost a large share of its incidents.
+
+    From one day to the next the feed grows. One that comes back with far
+    fewer incidents than the copy in use is a short export, or has lost the
+    coordinates its rows are kept by, and taking it would understate every
+    figure without a word. Refused, the copy in use stays and the pages say
+    that the refresh failed.
+
+    Raises:
+        ValueError: `new` has fewer than MIN_REFRESH_ROW_SHARE of the rows of
+            `previous`
+    """
+    if len(new) < len(previous) * MIN_REFRESH_ROW_SHARE:
+        raise ValueError(
+            f"the refreshed feed has only {len(new):,} usable incidents, against {len(previous):,} "
+            "in the copy shown; it may be incomplete or have lost its coordinates. "
+            "If the feed really has shrunk, restart the app to accept it"
+        )
+
+
 @st.cache_resource(show_spinner=False)
 def dataset_cache() -> RefreshingCache:
     """The one dataset cache shared by every session in this process.
@@ -413,6 +457,7 @@ def dataset_cache() -> RefreshingCache:
         ttl=DATA_CACHE_TTL,
         retry_interval=DATA_RETRY_INTERVAL,
         first_retry_interval=DATA_FIRST_LOAD_RETRY_INTERVAL,
+        check=refuse_shrunken_refresh,
     )
 
 
@@ -580,24 +625,60 @@ def days_in_year(year: int) -> int:
     return 366 if calendar.isleap(year) else 365
 
 
-def project_full_year(count_to_date: int, as_of: date) -> Optional[float]:
+def partial_years(data_start: date, data_end: date) -> dict[int, Tuple[date, date]]:
+    """
+    Years the dataset covers only in part, with the days of each it does cover.
+
+    Those are its first year, unless it starts on 1 January, and its last,
+    unless it ends on 31 December. Their counts are not those of a whole year,
+    so they are marked wherever years are set side by side.
+
+    Returns:
+        {year: (first day covered, last day covered)}
+    """
+    partial = {}
+    for year in {data_start.year, data_end.year}:
+        covered = selection_period(year, data_start, data_end)
+        if covered != (date(year, 1, 1), date(year, 12, 31)):
+            partial[year] = covered
+    return partial
+
+
+def part_year_note(first: date, last: date) -> str:
+    """Which part of its year a span of days is, in a few words: "to 9 Feb", "from 1 Jun"."""
+
+    def day_month(day: date) -> str:
+        return f"{day.day} {calendar.month_abbr[day.month]}"
+
+    if (first.month, first.day) == (1, 1):
+        return f"to {day_month(last)}"
+    if (last.month, last.day) == (12, 31):
+        return f"from {day_month(first)}"
+    return f"{day_month(first)} to {day_month(last)}"
+
+
+def project_full_year(count_to_date: int, as_of: date, data_start: date) -> Optional[float]:
     """
     Scale a year-to-date count up to a full-year estimate.
 
     Args:
-        count_to_date: Incidents from 1 January through `as_of`
+        count_to_date: Incidents in the year of `as_of`, through that day
         as_of: Last day the data covers. Using this rather than today's date
             keeps the estimate from being dragged down by the days between the
             end of the data and now (the feed lags by several days).
+        data_start: First day the data covers. When that is within the year,
+            the count is only of the days since then, and it is scaled up from
+            those rather than from the days since 1 January.
 
     Returns:
         Projected full-year count, or None until MIN_PROJECTION_DAYS of the
         year have data
     """
-    days_elapsed = as_of.timetuple().tm_yday
-    if days_elapsed < MIN_PROJECTION_DAYS:
+    first_day = max(date(as_of.year, 1, 1), data_start)
+    days_covered = (as_of - first_day).days + 1
+    if days_covered < MIN_PROJECTION_DAYS:
         return None
-    return count_to_date * days_in_year(as_of.year) / days_elapsed
+    return count_to_date * days_in_year(as_of.year) / days_covered
 
 
 def same_day_last_year(day: date) -> date:
@@ -608,7 +689,23 @@ def same_day_last_year(day: date) -> date:
         return day.replace(year=day.year - 1, day=28)
 
 
-def compute_yoy_deltas(df_filtered: pd.DataFrame, as_of: date) -> Tuple[Optional[str], Optional[str]]:
+# A change that rounds to nothing. It carries no sign, so that it is not drawn
+# as a rise or a fall (see `format_change`).
+NO_CHANGE = "0.0%"
+
+
+def format_change(fraction: float) -> str:
+    """A change as a signed percentage to one decimal place: "+4.2%", "-0.3%".
+
+    One that rounds to zero is NO_CHANGE, without a sign: "+0.0%" would be
+    taken for a rise and "-0.0%" for a fall by anything that goes by the sign.
+    """
+    text = f"{fraction * 100:+.1f}%"
+    return NO_CHANGE if text.lstrip("+-") == NO_CHANGE else text
+
+
+def compute_yoy_deltas(df_filtered: pd.DataFrame, as_of: date,
+                       data_start: date) -> Tuple[Optional[str], Optional[str]]:
     """
     Compute year-over-year deltas for Total Incidents and Avg Daily.
 
@@ -625,16 +722,22 @@ def compute_yoy_deltas(df_filtered: pd.DataFrame, as_of: date) -> Tuple[Optional
         df_filtered: Incidents for the current filter selection, with their
             local time in `incident_occurred_at`
         as_of: Last day the full dataset covers
+        data_start: First day the full dataset covers
 
     Returns:
-        (incidents_delta, avg_delta) as formatted strings, or None when
-        either span has no incidents or fewer than MIN_PROJECTION_DAYS of the
-        current year have data
+        (incidents_delta, avg_delta) as formatted strings (see
+        `format_change`), or None when either span has no incidents, when
+        fewer than MIN_PROJECTION_DAYS of the current year have data, or when
+        the dataset does not reach back to 1 January of the year before: the
+        days it lacks would be counted as days without incidents, and show as
+        a rise.
     """
     cy_days = as_of.timetuple().tm_yday
     if cy_days < MIN_PROJECTION_DAYS:
         return None, None
     prior_as_of = same_day_last_year(as_of)
+    if data_start > date(prior_as_of.year, 1, 1):
+        return None, None
     py_days = prior_as_of.timetuple().tm_yday
 
     def incidents_through(last_day: date) -> int:
@@ -649,10 +752,10 @@ def compute_yoy_deltas(df_filtered: pd.DataFrame, as_of: date) -> Tuple[Optional
     if cy_count == 0 or py_count == 0:
         return None, None
 
-    incidents_delta = f"{(cy_count - py_count) / py_count * 100:+.1f}%"
+    incidents_delta = format_change((cy_count - py_count) / py_count)
 
     cy_avg = cy_count / cy_days
     py_avg = py_count / py_days
-    avg_delta = f"{(cy_avg - py_avg) / py_avg * 100:+.1f}%"
+    avg_delta = format_change((cy_avg - py_avg) / py_avg)
 
     return incidents_delta, avg_delta

@@ -71,6 +71,7 @@ The application implements several data quality measures:
 - **Text Cleanup**: Trailing padding is trimmed from category, description, status, neighborhood and intersection values; a value that is only padding is treated as missing
 - **Day and Hour Numbers**: `incident_day_of_week` and `incident_hour_of_day` are read as whole numbers; a value that is not one (text, a fraction) is treated as missing
 - **Quality Control**: Removes records with missing, non-numeric or out-of-range coordinates, from every figure and not only from the map; a feed left with no rows is treated as a failed load
+- **Shrunken Refresh**: A refresh left with fewer than 90% of the incidents of the copy in use is refused as incomplete (a short export, or coordinates gone missing), and the copy in use is kept. A first load has nothing to be compared with and is taken as it comes
 - **Real-time Exclusion**: Excludes the feed's last day, and anything dated after it, to avoid incomplete data. The last day is the latest one with at least 10% of a typical (median) day's incidents, so a lone row with a mistyped later date is not taken for it
 - **Categorical Formatting**: Zip codes, precincts and districts are read as numeric codes; rows without a valid code (a whole number above zero, written as a plain number) are left out of charts that group by them (the pivot says how many)
 

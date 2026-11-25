@@ -5,7 +5,9 @@ Handles data loading, caching, sidebar filters, session state,
 and displays the Overview page (KPIs, summary charts, daily sparkline).
 """
 
+import time
 from datetime import date
+from typing import Callable
 
 import streamlit as st
 import pandas as pd
@@ -15,11 +17,12 @@ import requests
 from constants import (
     DATA_URL, REQUIRED_COLUMNS,
     MIN_DATE, DETROIT_LAT_MIN, DETROIT_LAT_MAX, DETROIT_LON_MIN, DETROIT_LON_MAX,
-    CHART_HEIGHT, TOP_N_ITEMS,
+    CHART_HEIGHT, TOP_N_ITEMS, DATA_FIRST_LOAD_RETRY_INTERVAL, DATA_POLL_INTERVAL,
 )
 from utils import (
-    TRANSIENT_ERRORS, DataNotReadyError, LoadFailedError, validate_data, safe_load_data_from_url,
-    clean_and_filter_data, compute_yoy_deltas, daily_incident_counts, dataset_cache, selection_period,
+    NO_CHANGE, TRANSIENT_ERRORS, DataNotReadyError, LoadFailedError, validate_data, safe_load_data_from_url,
+    clean_and_filter_data, compute_yoy_deltas, daily_incident_counts, dataset_cache, is_transient_error,
+    selection_period,
 )
 from theme import inject_css, apply_dark_plotly, BLUE_ACCENT, GREEN_ACCENT, RED_ACCENT
 
@@ -70,10 +73,41 @@ def load_error_message(error: BaseException) -> str:
         # What is left of them: a download cut short, or one that could not be decoded
         return "The download was interrupted before it finished. Please try again."
     if isinstance(error, requests.exceptions.HTTPError):
-        return f"Server error: {error}. The data source may be temporarily unavailable."
+        if is_transient_error(error):
+            return f"Server error: {error}. The data source may be temporarily unavailable."
+        # A 404 or 403 says the same on every try: waiting will not bring the data back
+        return (
+            f"The data portal would not serve the dataset: {error}. It may have been moved or "
+            "withdrawn, in which case the address the app downloads from needs updating."
+        )
     if isinstance(error, ValueError):
         return f"Data validation error: {error}"
     return f"Unexpected error loading data: {error}"
+
+
+@st.fragment(run_every=DATA_POLL_INTERVAL)
+def update_when(ready: Callable[[], bool], note: str) -> None:
+    """Show `note`, and draw the whole page again once `ready()` says so.
+
+    An open page asks every DATA_POLL_INTERVAL seconds. So one that is waiting
+    for a download shows what came of it without the user clicking anything,
+    and a visitor who only looks once is not left with the old figures.
+    """
+    st.caption(note)
+    if ready():
+        st.rerun()
+
+
+def change_style(delta: str | None) -> dict[str, str]:
+    """How `st.metric` is to draw a change from last year.
+
+    More crime is bad news, so a rise is shown in red and a fall in green
+    (inverse colors). A change that rounds to nothing is neither: it is drawn
+    in grey with no arrow, as `st.metric` would otherwise show it as a rise.
+    """
+    if delta == NO_CHANGE:
+        return {"delta_color": "off", "delta_arrow": "off"}
+    return {"delta_color": "inverse"}
 
 
 def format_daily_rate(per_day: float) -> str:
@@ -156,7 +190,9 @@ def overview_page() -> None:
     # every year together and for the current year, not for a past year.
     incidents_delta, avg_delta = None, None
     if selected_year in ("All", data_end_date.year):
-        incidents_delta, avg_delta = compute_yoy_deltas(run_data["df_all_years"], data_end_date)
+        incidents_delta, avg_delta = compute_yoy_deltas(
+            run_data["df_all_years"], data_end_date, st.session_state["data_start_date"]
+        )
     # The change is explained only where one is shown (both deltas come together)
     delta_help = None
     if incidents_delta is not None:
@@ -169,11 +205,10 @@ def overview_page() -> None:
         "Incidents with no coordinates, or with coordinates outside the Detroit area, are left out."
     )
 
-    # More crime is bad news, so increases are shown in red (inverse colors).
     with col1:
         st.metric(
             "Total Incidents", f"{len(df_filtered):,}",
-            delta=incidents_delta, delta_color="inverse",
+            delta=incidents_delta, **change_style(incidents_delta),
             help=f"{total_help} {delta_help}" if delta_help else total_help,
         )
     with col2:
@@ -183,7 +218,7 @@ def overview_page() -> None:
         )
     with col3:
         st.metric(
-            "Avg Daily", format_daily_rate(avg_daily), delta=avg_delta, delta_color="inverse",
+            "Avg Daily", format_daily_rate(avg_daily), delta=avg_delta, **change_style(avg_delta),
             help=delta_help,
         )
     with col4:
@@ -249,18 +284,39 @@ def main() -> None:
     # failure is reported. Only the first download is waited for, and it runs
     # on the cache's own thread, so a click that interrupts this script does
     # not throw it away.
+    cache = dataset_cache()
     try:
         with st.spinner("Downloading Detroit crime data..."):
-            df, refresh_error = dataset_cache().get(fetch_data)
+            df, refresh_error = cache.get(fetch_data)
     except LoadFailedError as e:
         # One of these is raised for each visitor; the failure itself is its cause
-        st.error(load_error_message(e.__cause__))
+        failure = e.__cause__
+        st.error(load_error_message(failure))
+        # The cache leaves a failed first load alone for a while, then tries
+        # again for the next run that asks. A failure that can pass is asked
+        # about again from here once that time is up; one that would only
+        # repeat (and may cost a whole download each time) waits for a reload.
+        if is_transient_error(failure):
+            retry_at = time.monotonic() + DATA_FIRST_LOAD_RETRY_INTERVAL
+            update_when(
+                lambda: time.monotonic() >= retry_at,
+                "The download will be tried again shortly, and this page will update by itself.",
+            )
         return
 
     if refresh_error is not None:
         st.warning(
             "The data could not be refreshed, so the last copy that loaded is shown. "
             + load_error_message(refresh_error)
+        )
+
+    # A refresh is running behind the copy shown here (wait returns False while
+    # one is): say so, and draw the page again when it has ended, with the new
+    # data or with the reason there is none.
+    if not cache.wait(timeout=0):
+        update_when(
+            lambda: cache.wait(timeout=0),
+            "Newer data is being downloaded. This page will update when it is ready.",
         )
 
     # Categories ordered most frequent first across the whole dataset. The Map

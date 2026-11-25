@@ -12,8 +12,11 @@ from constants import (
     CHART_HEIGHT, MIN_FORECAST_DAYS, FORECAST_PERIODS, HISTORICAL_MONTHS,
     FORECAST_CACHE_TTL, YOY_CACHE_TTL, DAY_LABELS, COLOR_SCALE_HEATMAP,
 )
-from utils import daily_incident_counts, project_full_year
+from utils import daily_incident_counts, part_year_note, partial_years, project_full_year
 from theme import inject_css, apply_dark_plotly, BLUE_ACCENT
+
+# How solid the bar of a year the data covers only in part is drawn (1 is a whole year)
+PART_YEAR_OPACITY = 0.45
 
 inject_css()
 
@@ -60,7 +63,8 @@ with left:
     st.subheader("Year over Year")
 
     @st.cache_data(ttl=YOY_CACHE_TTL)
-    def create_yoy(df, as_of):
+    def create_yoy(df, start, as_of):
+        """Incidents per year, for a dataset that covers `start` to `as_of`."""
         yearly = (
             df.groupby("incident_year").size().reset_index(name="count")
             .rename(columns={"incident_year": "year"})
@@ -68,12 +72,21 @@ with left:
 
         fig = px.bar(yearly, x="year", y="count", labels={"year": "Year", "count": "Incidents"})
 
+        # A year the data covers only in part is drawn lighter (the caption
+        # under the chart says which part). Its bar would otherwise be read as
+        # a fall: the current year always is one, and has no projection in its
+        # first weeks.
+        part_years = partial_years(start, as_of)
+        fig.update_traces(
+            marker_opacity=[PART_YEAR_OPACITY if year in part_years else 1 for year in yearly["year"]]
+        )
+
         # Extend the latest year's bar to its projected full-year total
         current_year = as_of.year
         current = yearly.loc[yearly["year"] == current_year, "count"]
         if not current.empty:
             current_count = int(current.iloc[0])
-            projected = project_full_year(current_count, as_of)
+            projected = project_full_year(current_count, as_of, start)
             if projected is not None and projected > current_count:
                 fig.add_bar(
                     x=[current_year],
@@ -89,9 +102,18 @@ with left:
         fig.update_xaxes(dtick=1)
         return fig
 
-    fig_yoy = create_yoy(df_filtered, data_end_date)
+    fig_yoy = create_yoy(df_filtered, data_start_date, data_end_date)
     apply_dark_plotly(fig_yoy, BLUE_ACCENT)
     st.plotly_chart(fig_yoy, width="stretch")
+
+    # Which part of a year each lighter bar stands for
+    years_shown = set(df_filtered["incident_year"].unique())
+    part_years = partial_years(data_start_date, data_end_date)
+    part_notes = [
+        f"{year} ({part_year_note(*part_years[year])})" for year in sorted(part_years) if year in years_shown
+    ]
+    if part_notes:
+        st.caption(f"Lighter bars cover part of a year: {', '.join(part_notes)}.")
 
 with right:
     st.subheader("Hour of Day × Day of Week")
