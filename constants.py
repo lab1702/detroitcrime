@@ -29,8 +29,15 @@ TOP_N_ITEMS = 10
 # Scatter mode plots at most this many points; wider selections are sampled.
 MAX_SCATTER_POINTS = 250_000
 
+# Share of timestamps that may be unreadable before the load is refused. A few
+# bad rows are dropped; more than this means the feed itself has changed.
+MAX_UNPARSEABLE_DATE_SHARE = 0.01
+
 # Cache settings (in seconds)
 DATA_CACHE_TTL = 86400  # 24 hours
+# After a failed refresh the previous data stays in use; wait this long before
+# trying the download again.
+DATA_RETRY_INTERVAL = 900  # 15 minutes
 FORECAST_CACHE_TTL = 3600  # 1 hour
 YOY_CACHE_TTL = 1800  # 30 minutes
 
@@ -63,8 +70,13 @@ TEXT_COLUMNS = [
     'nearest_intersection',
 ]
 
-# Categorical variables that need special formatting
-CATEGORICAL_VARS = ['zip_code', 'police_precinct', 'council_district']
+# Columns holding numeric codes, with the prefix used to label each code
+# (e.g. 3 -> "Precinct 3"; zip codes are shown as they are).
+CODE_LABEL_PREFIXES = {
+    'zip_code': '',
+    'police_precinct': 'Precinct',
+    'council_district': 'District',
+}
 
 # Day of week labels. The feed numbers days ISO-style: 1=Monday ... 7=Sunday.
 DAY_LABELS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']

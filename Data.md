@@ -52,7 +52,7 @@
 The application requires the following columns for proper functionality:
 - `latitude`, `longitude` - Geographic coordinates
 - `incident_occurred_at` - Date/time information
-- `incident_entry_id` - Unique identifier for counting
+- `incident_entry_id` - Unique identifier (required to be present; counts are by row)
 - `offense_category`, `offense_description` - Crime classification
 - `case_status` - Case status information
 - `police_precinct`, `council_district`, `neighborhood` - Geographic divisions
@@ -64,16 +64,17 @@ The application requires the following columns for proper functionality:
 The application implements several data quality measures:
 - **Geographic Filtering**: Latitude (42.0-43.0), Longitude (-84.0 to -82.0)
 - **Local Time**: `incident_occurred_at` is converted from UTC to Detroit time (`America/Detroit`); `date` and `incident_year` are derived from the local time
-- **Temporal Filtering**: Data from 2018-01-01 (local time) onwards
+- **Temporal Filtering**: Data from 2018-01-01 (local time) onwards; incidents dated after the current day are dropped
+- **Unreadable Timestamps**: Rows whose timestamp cannot be read are dropped; if more than 1% are unreadable the load is refused
 - **Text Cleanup**: Trailing padding is trimmed from category, description, status, neighborhood and intersection values
-- **Quality Control**: Removes records with missing coordinates or invalid values
+- **Quality Control**: Removes records with missing coordinates or invalid values; a feed left with no rows is treated as a failed load
 - **Real-time Exclusion**: Excludes most recent date to avoid incomplete data
-- **Categorical Formatting**: Special handling for zip codes, precincts, and districts
+- **Categorical Formatting**: Zip codes, precincts and districts are read as numeric codes; rows without a valid code are left out of charts that group by them
 
 ## Data Quality Notes
 
 - Some records may have missing coordinates (empty X, Y values)
-- Incidents span multiple years (2017-2025 based on sample)
+- The feed holds incidents reported from December 2016 to the present; an incident can have occurred before it was reported, and the app keeps those from 2018-01-01 onwards
 - Real-time data with recent incidents marked as "ACTIVE"
 - Each row is one offense: a report with several charges appears once per charge, so counts are offenses, not distinct reports
 - The portal export typically lags the present by several days; year-to-date figures are measured up to the last day in the data

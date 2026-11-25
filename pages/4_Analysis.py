@@ -4,9 +4,12 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-from constants import CHART_HEIGHT, PIVOT_COLUMNS, COLOR_SCALE_HEATMAP, CATEGORICAL_VARS
-from utils import format_categorical_column, format_zip_code_column
+from constants import CHART_HEIGHT, PIVOT_COLUMNS, COLOR_SCALE_HEATMAP, CODE_LABEL_PREFIXES
+from utils import code_labels, numeric_codes
 from theme import inject_css, apply_dark_plotly, TEAL_ACCENT
+
+# Numeric fields shown on a continuous axis that should only tick on whole numbers
+WHOLE_NUMBER_FIELDS = {"incident_year", "incident_day_of_week"}
 
 inject_css()
 
@@ -57,32 +60,24 @@ st.session_state["pivot_columns_selection"] = columns
 
 # ── Create pivot table ───────────────────────────────────────────────────────
 try:
-    required_cols = list(set([rows, columns, "incident_entry_id"]))
-    df_sub = df_filtered[required_cols].copy()
+    df_sub = df_filtered[list({rows, columns})]
 
-    if rows in CATEGORICAL_VARS:
-        prefix = "Precinct" if rows == "police_precinct" else "District" if rows == "council_district" else ""
-        if rows == "zip_code":
-            df_sub = format_zip_code_column(df_sub, rows)
-        else:
-            df_sub = format_categorical_column(df_sub, rows, prefix)
+    # Precinct, district and zip codes are pivoted as numbers, so they sort as
+    # numbers (Precinct 2 before Precinct 10), and are labelled afterwards.
+    # Rows without a valid code are left out.
+    for field in {rows, columns} & CODE_LABEL_PREFIXES.keys():
+        codes = numeric_codes(df_sub[field])
+        df_sub = df_sub.assign(**{field: codes})[codes != 0]
 
-    if columns in CATEGORICAL_VARS and columns != rows:
-        prefix = "Precinct" if columns == "police_precinct" else "District" if columns == "council_district" else ""
-        if columns == "zip_code":
-            df_sub = format_zip_code_column(df_sub, columns)
-        else:
-            df_sub = format_categorical_column(df_sub, columns, prefix)
+    # Counts rows, so every incident in the selection is included
+    pivot_table = pd.pivot_table(df_sub, index=rows, columns=columns, aggfunc="size", fill_value=0)
 
-    pivot_table = pd.pivot_table(
-        df_sub, index=rows, columns=columns, values="incident_entry_id",
-        aggfunc="count", fill_value=0,
-    )
-
-    if rows == "zip_code":
-        pivot_table.index = pivot_table.index.astype(str)
-    if columns == "zip_code":
-        pivot_table.columns = pivot_table.columns.astype(str)
+    if rows in CODE_LABEL_PREFIXES:
+        labels = code_labels(pivot_table.index, CODE_LABEL_PREFIXES[rows])
+        pivot_table.index = pd.Index(labels, name=rows)
+    if columns in CODE_LABEL_PREFIXES:
+        labels = code_labels(pivot_table.columns, CODE_LABEL_PREFIXES[columns])
+        pivot_table.columns = pd.Index(labels, name=columns)
 
     fig = px.imshow(
         pivot_table,
@@ -90,10 +85,16 @@ try:
         aspect="auto",
         color_continuous_scale=COLOR_SCALE_HEATMAP,
     )
-    if rows == "zip_code":
+    # Code labels are categories even when they look like numbers (zip codes).
+    # Years and weekdays are numbers: tick on whole values only, not 2024.5.
+    if rows in CODE_LABEL_PREFIXES:
         fig.update_yaxes(type="category")
-    if columns == "zip_code":
+    elif rows in WHOLE_NUMBER_FIELDS:
+        fig.update_yaxes(dtick=1)
+    if columns in CODE_LABEL_PREFIXES:
         fig.update_xaxes(type="category")
+    elif columns in WHOLE_NUMBER_FIELDS:
+        fig.update_xaxes(dtick=1)
     fig.update_layout(height=CHART_HEIGHT)
     apply_dark_plotly(fig, TEAL_ACCENT)
     st.plotly_chart(fig, width="stretch")

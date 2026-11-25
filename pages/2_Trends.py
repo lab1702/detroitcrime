@@ -12,7 +12,7 @@ from constants import (
     CHART_HEIGHT, MIN_FORECAST_DAYS, FORECAST_PERIODS, HISTORICAL_MONTHS,
     FORECAST_CACHE_TTL, YOY_CACHE_TTL, DAY_LABELS, COLOR_SCALE_HEATMAP,
 )
-from utils import project_full_year
+from utils import daily_incident_counts, project_full_year
 from theme import inject_css, apply_dark_plotly, BLUE_ACCENT
 
 inject_css()
@@ -29,16 +29,21 @@ if df_filtered.empty:
     st.warning("No data available for selected filters.")
     st.stop()
 
-# Last day the dataset covers; "today" for year-to-date projections
+# First and last day the dataset covers; the last is "today" for year-to-date
+# projections and the day the forecast starts from
+data_start_date = st.session_state["data_start_date"]
 data_end_date = st.session_state["data_end_date"]
+# Days covered by the Year filter
+period_start = st.session_state["period_start"]
+period_end = st.session_state["period_end"]
+selected_year = st.session_state.get("selected_year", "All")
+# The category selection across every year, which the forecast is fitted on
+df_all_years: pd.DataFrame = st.session_state["df_all_years"]
 
 
 # ── Daily Incidents (full width) ─────────────────────────────────────────────
 st.subheader("Daily Incidents")
-daily = df_filtered.groupby("date").size().reset_index(name="count")
-daily["date"] = pd.to_datetime(daily["date"])
-date_range = pd.date_range(start=daily["date"].min(), end=daily["date"].max(), freq="D")
-daily = pd.DataFrame({"date": date_range}).merge(daily, on="date", how="left").fillna(0)
+daily = daily_incident_counts(df_filtered, period_start, period_end)
 
 fig_daily = px.line(daily, x="date", y="count", labels={"date": "Date", "count": "Incidents"})
 fig_daily.update_layout(height=CHART_HEIGHT)
@@ -78,6 +83,8 @@ with left:
                 )
 
         fig.update_layout(height=CHART_HEIGHT, barmode="overlay")
+        # One tick per year: with few bars the axis would otherwise show 2024.5
+        fig.update_xaxes(dtick=1)
         return fig
 
     fig_yoy = create_yoy(df_filtered, data_end_date)
@@ -96,7 +103,10 @@ with right:
         )
         pivot = heatmap_data.pivot(
             index="incident_day_of_week", columns="incident_hour_of_day", values="count"
-        ).fillna(0)
+        )
+        # Always the full week by 24 hours, so a small selection is not drawn
+        # as a few stretched cells
+        pivot = pivot.reindex(index=range(1, 8), columns=range(24)).fillna(0)
 
         fig = px.imshow(
             pivot,
@@ -119,23 +129,18 @@ st.subheader("1-Year Forecast")
 
 
 @st.cache_data(ttl=FORECAST_CACHE_TTL)
-def create_forecast(df: pd.DataFrame) -> Optional[go.Figure]:
+def create_forecast(df: pd.DataFrame, start, end) -> Optional[go.Figure]:
     """Create Prophet forecast for incident count.
+
+    The model is fitted on every day from `start` to `end` (the days the
+    dataset covers), counting days without incidents as zero, and forecasts
+    the year after `end`.
 
     Returns None when there is too little history to forecast. Errors are
     raised, not swallowed, so a failed fit is never cached as a result.
     """
-    daily_counts = df.groupby("date").size().reset_index()
-    daily_counts.columns = ["ds", "y"]
-    daily_counts["ds"] = pd.to_datetime(daily_counts["ds"])
-
-    date_range = pd.date_range(
-        start=daily_counts["ds"].min(), end=daily_counts["ds"].max(), freq="D"
-    )
-    daily_counts = (
-        pd.DataFrame({"ds": date_range})
-        .merge(daily_counts, on="ds", how="left")
-        .fillna(0)
+    daily_counts = daily_incident_counts(df, start, end).rename(
+        columns={"date": "ds", "count": "y"}
     )
 
     if len(daily_counts) < MIN_FORECAST_DAYS:
@@ -169,7 +174,10 @@ def create_forecast(df: pd.DataFrame) -> Optional[go.Figure]:
         )
     )
 
-    future_dates = forecast[forecast["ds"] > daily_counts["ds"].max()]
+    future_dates = forecast[forecast["ds"] > forecast_start].copy()
+    # Prophet knows nothing about counts: keep the forecast and its band at or above zero
+    bands = ["yhat", "yhat_lower", "yhat_upper"]
+    future_dates[bands] = future_dates[bands].clip(lower=0)
     fig.add_trace(
         go.Scatter(
             x=future_dates["ds"],
@@ -248,8 +256,14 @@ def create_forecast(df: pd.DataFrame) -> Optional[go.Figure]:
     return fig
 
 
+if selected_year != "All":
+    st.caption(
+        "The forecast is fitted on every year of data for this selection and starts "
+        "after the last day of data, so the Year filter does not apply to it."
+    )
+
 try:
-    forecast_fig = create_forecast(df_filtered)
+    forecast_fig = create_forecast(df_all_years, data_start_date, data_end_date)
 except Exception as e:
     st.error(f"Error creating forecast: {str(e)}")
 else:

@@ -28,6 +28,7 @@ An interactive web application for visualizing and analyzing Detroit crime incid
 - **Streamlit**: Web application framework
 - **Pandas**: Data manipulation and analysis
 - **Plotly**: Interactive visualizations
+- **PyDeck**: Map rendering (scatter and heatmap layers)
 - **Prophet**: Time series forecasting with holiday support
 - **NumPy**: Numerical computing
 - **Requests**: HTTP library for data fetching
@@ -108,9 +109,9 @@ detroitcrime/
 
 ## Key Components
 
-### Data Loading (`load_data()`)
-- Fetches data from Detroit Open Data Portal
-- Implements 24-hour caching for performance
+### Data Loading (`fetch_data()` and `dataset_cache()`)
+- Fetches data from Detroit Open Data Portal, retrying network errors, rate limiting and server errors
+- Keeps the data for 24 hours, then refreshes it; if a refresh fails, the previous copy stays in use and a warning is shown
 - Cleans and filters data for quality
 - Removes invalid coordinates and recent incomplete data
 
@@ -118,8 +119,8 @@ detroitcrime/
 
 The dashboard has five pages, all driven by the sidebar filters:
 
-1. **Overview**: KPI cards with year-over-year change, top categories (or offense descriptions when a category is selected), case status, daily incidents
-2. **Trends**: Daily incidents, year over year with a projection for the latest year, hour of day x day of week heatmap, 1-year Prophet forecast with holiday annotations
+1. **Overview**: KPI cards with year-over-year change, top categories (or offense descriptions when a category is selected), case status, daily incidents. The daily average is measured over the whole selected period, including days without incidents
+2. **Trends**: Daily incidents, year over year with a projection for the latest year, hour of day x day of week heatmap, 1-year Prophet forecast with holiday annotations. The forecast is fitted on every year of the selected category, so the Year filter does not apply to it
 3. **Geography**: Top neighborhoods, police precincts, council districts, zip codes and intersections
 4. **Pivot Analysis**: Interactive pivot table with customizable rows and columns
 5. **Map**: Incident locations as colour-coded points (sampled above 250,000 points) or as a density heatmap
@@ -161,6 +162,8 @@ The application implements several data quality measures:
 - Removes records with missing coordinates
 - Filters out invalid coordinates (latitude: 42.0-43.0, longitude: -84.0 to -82.0)
 - Converts feed timestamps from UTC to Detroit local time before deriving dates and years
+- Drops timestamps that cannot be read, and refuses the load if more than 1% of them are unreadable
+- Drops incidents dated after the current day
 - Excludes the most recent date to avoid incomplete data
 - Filters data from 2018-01-01 onwards for consistency
 - Trims padded text values so the same value is not counted twice
@@ -192,8 +195,4 @@ The application implements several data quality measures:
 
 ## License
 
-[Add appropriate license information]
-
-## Contributing
-
-[Add contributing guidelines if applicable]
+MIT License. See [LICENSE](LICENSE).

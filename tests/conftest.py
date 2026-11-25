@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
 from constants import (  # noqa: E402
     DETROIT_LAT_MAX, DETROIT_LAT_MIN, DETROIT_LON_MAX, DETROIT_LON_MIN, MIN_DATE,
 )
-from utils import clean_and_filter_data  # noqa: E402
+from utils import clean_and_filter_data, selection_period  # noqa: E402
 
 # More categories than the map palette has colors (15), to exercise "Other"
 CATEGORIES = [f"CATEGORY {i:02d}" for i in range(1, 21)]
@@ -71,12 +71,27 @@ def clean_df(raw_feed) -> pd.DataFrame:
     )
 
 
+def make_page_state(full: pd.DataFrame, category: str = "All", year="All") -> dict:
+    """The session state app.py prepares before running a page, for the given filters."""
+    data_start = full["incident_occurred_at"].min().date()
+    data_end = full["incident_occurred_at"].max().date()
+    df_all_years = full if category == "All" else full[full["offense_category"] == category]
+    df_filtered = df_all_years if year == "All" else df_all_years[df_all_years["incident_year"] == year]
+    period_start, period_end = selection_period(year, data_start, data_end)
+    return {
+        "df_filtered": df_filtered,
+        "df_all_years": df_all_years,
+        "selected_category": category,
+        "selected_year": year,
+        "category_order": full["offense_category"].value_counts().index.tolist(),
+        "data_start_date": data_start,
+        "data_end_date": data_end,
+        "period_start": period_start,
+        "period_end": period_end,
+    }
+
+
 @pytest.fixture
 def page_state(clean_df) -> dict:
-    """The session state app.py prepares before running a page."""
-    return {
-        "df_filtered": clean_df,
-        "selected_category": "All",
-        "category_order": clean_df["offense_category"].value_counts().index.tolist(),
-        "data_end_date": clean_df["incident_occurred_at"].max().date(),
-    }
+    """The session state app.py prepares before running a page, with no filters."""
+    return make_page_state(clean_df)
