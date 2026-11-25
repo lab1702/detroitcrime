@@ -20,6 +20,8 @@ DETROIT_LON_MAX = -82.0
 # Forecasting parameters
 MIN_FORECAST_DAYS = 30
 FORECAST_PERIODS = 365  # 1 year
+# Days of the current year needed before it is projected to a full year or
+# compared with the year before
 MIN_PROJECTION_DAYS = 60  # 2 months
 HISTORICAL_MONTHS = 3  # 3 months of history in forecast chart
 
@@ -27,7 +29,9 @@ HISTORICAL_MONTHS = 3  # 3 months of history in forecast chart
 CHART_HEIGHT = 400
 TOP_N_ITEMS = 10
 # Scatter mode plots at most this many points; wider selections are sampled.
-MAX_SCATTER_POINTS = 250_000
+# Every point is sent to the browser on each rerun, at about 110 bytes apiece,
+# so this many is some 5 MB.
+MAX_SCATTER_POINTS = 50_000
 
 # Share of timestamps that may be unreadable before the load is refused. A few
 # bad rows are dropped; more than this means the feed itself has changed.
@@ -75,6 +79,13 @@ TEXT_COLUMNS = [
     'case_status',
     'neighborhood',
     'nearest_intersection',
+]
+
+# Columns holding plain numbers (the local day of the week and hour of the
+# day). They are read as numbers on load; a cell that is not one is missing.
+NUMBER_COLUMNS = [
+    'incident_day_of_week',
+    'incident_hour_of_day',
 ]
 
 # Columns holding numeric codes, with the prefix used to label each code

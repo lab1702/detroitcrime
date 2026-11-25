@@ -13,7 +13,7 @@ import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 import utils
-from conftest import make_page_state
+from conftest import clean_feed, make_page_state
 from constants import DAY_LABELS, MAX_SCATTER_POINTS
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -21,7 +21,7 @@ TIMEOUT = 300  # the Trends page fits a Prophet model
 
 
 def run_page(name: str, state: dict) -> AppTest:
-    at = AppTest.from_file(str(ROOT / "pages" / name), default_timeout=TIMEOUT)
+    at = AppTest.from_file(str(ROOT / "views" / name), default_timeout=TIMEOUT)
     for key, value in state.items():
         at.session_state[key] = value
     at.run()
@@ -66,6 +66,28 @@ def clear_caches():
     st.cache_data.clear()
     st.cache_resource.clear()
     yield
+
+
+# ── Navigation ───────────────────────────────────────────────────────────────
+
+def test_page_scripts_are_not_kept_in_a_pages_folder():
+    # Until st.navigation has been called once, Streamlit runs the scripts of a
+    # pages/ folder on their own, without app.py (see the note in app.main)
+    assert not (ROOT / "pages").exists()
+
+
+def test_first_visit_on_a_page_url_goes_through_the_app(raw_feed, monkeypatch):
+    # A new server whose first visitor arrives on /Trends, not on the front page
+    monkeypatch.setattr(utils, "safe_load_data_from_url", lambda url, **kwargs: raw_feed.copy())
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
+    at.switch_page("views/2_Trends.py").run()
+
+    assert not at.exception, at.exception
+    assert "Trends" in [h.value for h in at.header]
+    # app.py ran first: the data is loaded, the filters are there, the charts are drawn
+    assert not at.warning
+    assert [s.label for s in at.sidebar.selectbox] == ["Offense Category", "Year"]
+    assert len(plotly_figures(at)) == 4
 
 
 # ── Overview (through app.py, with the download replaced) ────────────────────
@@ -131,6 +153,18 @@ def test_top_descriptions_are_not_split_by_padding(overview):
     assert labels == ["CATEGORY 01 - DETAIL"]
 
 
+def test_overview_without_any_category(raw_feed, clean_df, monkeypatch):
+    # The category column arrives empty: there is no most common one to name,
+    # and nothing for the categories chart to draw
+    at = run_app(raw_feed.assign(offense_category=np.nan), monkeypatch)
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics["Most Common"] == "—"
+    assert metrics["Total Incidents"] == f"{len(clean_df):,}"
+    assert [i.value for i in at.info] == ["Nothing recorded for this selection."]
+    # Case status and daily incidents are drawn as usual
+    assert len(plotly_figures(at)) == 2
+
+
 def test_rare_category_is_measured_over_the_whole_period(raw_feed, clean_df, monkeypatch):
     # Three incidents on two consecutive days, in a feed that covers 22 months
     feed = raw_feed.copy()
@@ -192,18 +226,51 @@ def test_failed_first_load_is_not_repeated_by_the_next_rerun(monkeypatch):
     ]
 
 
+def test_download_cut_short_is_reported_in_plain_words(monkeypatch):
+    def cut_short(url, **kwargs):
+        raise requests.exceptions.ChunkedEncodingError("Connection broken: IncompleteRead(1024 bytes read)")
+
+    monkeypatch.setattr(utils, "safe_load_data_from_url", cut_short)
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
+    at.run()
+    assert [e.value for e in at.error] == ["The download was interrupted before it finished. Please try again."]
+
+
 def test_failed_refresh_keeps_showing_the_last_data(overview, monkeypatch):
     # The data is due for a refresh, and the portal is down
     monkeypatch.setattr(utils, "safe_load_data_from_url", portal_down)
     utils.dataset_cache().expire()
-    overview.run()
 
+    # The refresh runs behind the page, which shows the data it has without waiting
+    overview.run()
+    assert not overview.exception and not overview.error and not overview.warning
+    assert {m.label for m in overview.metric} >= {"Total Incidents", "Avg Daily"}
+
+    # Once the refresh has failed the next run says so, and still shows the data
+    assert utils.dataset_cache().wait(timeout=TIMEOUT)
+    overview.run()
     assert not overview.exception and not overview.error
     assert [w.value for w in overview.warning] == [
         "The data could not be refreshed, so the last copy that loaded is shown. "
         "Connection failed. Please check your internet connection and try again."
     ]
     assert {m.label for m in overview.metric} >= {"Total Incidents", "Avg Daily"}
+
+
+def test_refreshed_data_is_shown_on_the_run_after_it_arrives(overview, raw_feed, monkeypatch):
+    # The feed has lost its last month by the time the data is due for a refresh
+    shorter = raw_feed[raw_feed["incident_occurred_at"] < "2026/03/01"]
+    monkeypatch.setattr(utils, "safe_load_data_from_url", lambda url, **kwargs: shorter.copy())
+    before = {m.label: m.value for m in overview.metric}["Total Incidents"]
+    utils.dataset_cache().expire()
+
+    overview.run()
+    assert {m.label: m.value for m in overview.metric}["Total Incidents"] == before
+
+    assert utils.dataset_cache().wait(timeout=TIMEOUT)
+    overview.run()
+    assert not overview.exception and not overview.warning
+    assert {m.label: m.value for m in overview.metric}["Total Incidents"] != before
 
 
 def test_feed_with_no_usable_rows_is_an_error_and_is_not_kept(raw_feed, monkeypatch):
@@ -251,6 +318,18 @@ def test_heatmap_always_shows_the_full_week_and_day(clean_df):
     assert values(heatmap["x"]) == list(range(24))
     assert values(heatmap["y"]) == [1, 2, 3, 4, 5, 6, 7]
     assert sum(values(heatmap["z"])) == 12
+
+
+def test_heatmap_counts_the_rest_when_a_day_cell_is_not_a_number(raw_feed):
+    # One bad cell makes read_csv hand over the whole day column as text
+    feed = raw_feed.assign(incident_day_of_week=raw_feed["incident_day_of_week"].astype(str))
+    feed.loc[feed.index[0], "incident_day_of_week"] = "UNK"
+    df = clean_feed(feed)
+
+    at = run_page("2_Trends.py", make_page_state(df))
+    heatmap = next(f for f in plotly_figures(at) if f["data"][0]["type"] == "heatmap")["data"][0]
+    assert values(heatmap["y"]) == [1, 2, 3, 4, 5, 6, 7]
+    assert sum(values(heatmap["z"])) == len(df) - 1
 
 
 def test_forecast_ignores_the_year_filter(clean_df):
@@ -419,6 +498,14 @@ def test_geography_charts(page_state):
     assert set(zips) == {"48201", "48226", "48207", "48210"}
 
 
+def test_geography_without_a_value_to_count(page_state, clean_df):
+    # No incident in the selection has a neighborhood or a usable zip code
+    nowhere = clean_df.assign(neighborhood=np.nan, zip_code="unknown")
+    at = run_page("3_Geography.py", dict(page_state, df_filtered=nowhere))
+    assert [i.value for i in at.info] == ["Nothing recorded for this selection."] * 2
+    assert len(plotly_figures(at)) == 3
+
+
 # ── Map ──────────────────────────────────────────────────────────────────────
 
 def legend_colors(at: AppTest) -> dict:
@@ -465,6 +552,18 @@ def test_map_samples_very_wide_selections(page_state, clean_df):
 
     assert len(deck_spec(at)["layers"][0]["data"]) == MAX_SCATTER_POINTS
     assert at.caption[0].value.startswith(f"Showing a random sample of {MAX_SCATTER_POINTS:,} of {len(too_many):,}")
+
+
+def test_map_view_is_kept_for_the_next_visit(page_state):
+    at = run_page("5_Map.py", page_state)
+    assert at.radio[0].value == "Scatter"
+    at.radio[0].set_value("Heatmap").run()
+    assert at.session_state["map_view_selection"] == "Heatmap"
+
+    # Coming back to the page: widget state is gone, the saved choice is not
+    at = run_page("5_Map.py", dict(page_state, map_view_selection="Heatmap"))
+    assert at.radio[0].value == "Heatmap"
+    assert deck_spec(at)["layers"][0]["@@type"] == "HeatmapLayer"
 
 
 def test_map_heatmap_weights_cover_every_incident(page_state, clean_df):

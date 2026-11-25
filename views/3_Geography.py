@@ -23,8 +23,15 @@ if df_filtered.empty:
     st.stop()
 
 
-def bar_chart(counts, y_label: str, accent: str, height: int = CHART_HEIGHT):
-    """Create a styled horizontal bar chart from value counts."""
+def bar_chart(counts: pd.Series, y_label: str, accent: str, height: int = CHART_HEIGHT) -> None:
+    """Draw value counts as a styled horizontal bar chart, the largest on top.
+
+    With nothing to count (no incident in the selection has the value) it
+    says so instead: Plotly Express does not take empty data.
+    """
+    if counts.empty:
+        st.info("Nothing recorded for this selection.")
+        return
     fig = px.bar(
         x=counts.values[::-1],
         y=counts.index[::-1],
@@ -34,7 +41,7 @@ def bar_chart(counts, y_label: str, accent: str, height: int = CHART_HEIGHT):
     fig.update_layout(height=height)
     fig.update_yaxes(type="category")
     apply_dark_plotly(fig, accent)
-    return fig
+    st.plotly_chart(fig, width="stretch")
 
 
 # ── Row 1: Neighborhoods + Precincts ────────────────────────────────────────
@@ -43,13 +50,13 @@ left, right = st.columns(2)
 with left:
     st.subheader(f"Top {TOP_N_ITEMS} Neighborhoods")
     counts = df_filtered["neighborhood"].value_counts().head(TOP_N_ITEMS)
-    st.plotly_chart(bar_chart(counts, "Neighborhood", RED_ACCENT), width="stretch")
+    bar_chart(counts, "Neighborhood", RED_ACCENT)
 
 with right:
     st.subheader(f"Top {TOP_N_ITEMS} Police Precincts")
     precincts = format_categorical_series(df_filtered["police_precinct"], "Precinct")
     counts = precincts.value_counts().head(TOP_N_ITEMS)
-    st.plotly_chart(bar_chart(counts, "Precinct", AMBER_ACCENT), width="stretch")
+    bar_chart(counts, "Precinct", AMBER_ACCENT)
 
 
 # ── Row 2: Districts + Zip Codes ─────────────────────────────────────────────
@@ -59,16 +66,16 @@ with left2:
     st.subheader(f"Top {TOP_N_ITEMS} Council Districts")
     districts = format_categorical_series(df_filtered["council_district"], "District")
     counts = districts.value_counts().head(TOP_N_ITEMS)
-    st.plotly_chart(bar_chart(counts, "District", RED_ACCENT), width="stretch")
+    bar_chart(counts, "District", RED_ACCENT)
 
 with right2:
     st.subheader(f"Top {TOP_N_ITEMS} Zip Codes")
     zip_codes = format_categorical_series(df_filtered["zip_code"])
     counts = zip_codes.value_counts().head(TOP_N_ITEMS)
-    st.plotly_chart(bar_chart(counts, "Zip Code", AMBER_ACCENT), width="stretch")
+    bar_chart(counts, "Zip Code", AMBER_ACCENT)
 
 
 # ── Row 3: Top Locations (full width) ────────────────────────────────────────
 st.subheader(f"Top {TOP_N_ITEMS} Locations")
 counts = df_filtered["nearest_intersection"].value_counts().head(TOP_N_ITEMS)
-st.plotly_chart(bar_chart(counts, "Intersection", RED_ACCENT), width="stretch")
+bar_chart(counts, "Intersection", RED_ACCENT)

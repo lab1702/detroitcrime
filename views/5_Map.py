@@ -35,7 +35,14 @@ if df_map.empty:
     st.stop()
 
 # ── Controls ─────────────────────────────────────────────────────────────────
-mode = st.radio("View", ["Scatter", "Heatmap"], horizontal=True)
+# Streamlit drops a widget's state while its page is not shown, so the chosen
+# view is also kept under a plain session-state key and used to seed the
+# widget when the user comes back to this page.
+VIEWS = ["Scatter", "Heatmap"]
+if "map_view" not in st.session_state:
+    st.session_state["map_view"] = st.session_state.get("map_view_selection", VIEWS[0])
+mode = st.radio("View", VIEWS, horizontal=True, key="map_view")
+st.session_state["map_view_selection"] = mode
 
 # Detroit center
 DETROIT_LAT = 42.3314

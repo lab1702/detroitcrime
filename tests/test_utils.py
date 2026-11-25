@@ -14,9 +14,9 @@ import utils
 from constants import REQUIRED_COLUMNS
 from theme import BLUE_ACCENT, RED_ACCENT, apply_dark_plotly
 from utils import (
-    DataNotReadyError, RefreshingCache, clean_and_filter_data, code_labels, compute_yoy_deltas,
-    daily_incident_counts, day_labels, format_categorical_series, numeric_codes, project_full_year,
-    safe_load_data_from_url, selection_period,
+    DataNotReadyError, LoadFailedError, RefreshingCache, clean_and_filter_data, code_labels,
+    compute_yoy_deltas, daily_incident_counts, day_labels, format_categorical_series, numeric_codes,
+    project_full_year, safe_load_data_from_url, same_day_last_year, selection_period,
 )
 
 BOUNDS = ((42.0, 43.0), (-84.0, -82.0))
@@ -146,6 +146,24 @@ class TestBadCoordinates:
         assert df["latitude"].tolist() == [42.33, 42.35]
 
 
+class TestDayAndHourNumbers:
+    def test_cell_that_is_not_a_number_is_missing_and_the_rest_are_numbers(self):
+        # One bad cell makes read_csv hand over the whole column as text
+        df = clean(feed_rows(
+            ["2024/03/01 15:00:00+00", "2024/03/01 16:00:00+00", "2024/03/01 17:00:00+00", LATER],
+            incident_day_of_week=["5", "UNK", "5", "2"],
+            incident_hour_of_day=["10", "11", "x", "7"],
+        ))
+        assert df["incident_day_of_week"].isna().tolist() == [False, True, False]
+        assert df["incident_day_of_week"].dropna().tolist() == [5, 5]
+        assert df["incident_hour_of_day"].isna().tolist() == [False, False, True]
+        assert df["incident_hour_of_day"].dropna().tolist() == [10, 11]
+
+    def test_numbers_are_left_as_they_are(self, raw_feed, clean_df):
+        assert pd.api.types.is_integer_dtype(clean_df["incident_day_of_week"])
+        assert set(clean_df["incident_hour_of_day"]) == set(range(24))
+
+
 class TestTextCleanup:
     def test_padding_only_is_a_missing_value(self):
         df = clean(feed_rows(
@@ -198,7 +216,7 @@ class TestYearOverYear:
     @staticmethod
     def yearly(prior_dates, current_dates) -> pd.DataFrame:
         dates = pd.to_datetime(list(prior_dates) + list(current_dates))
-        return pd.DataFrame({"incident_year": dates.year, "date": dates.date})
+        return pd.DataFrame({"incident_year": dates.year, "date": dates.date, "incident_occurred_at": dates})
 
     def test_flat_year_shows_no_change_whatever_today_is(self):
         prior = pd.date_range("2025-01-01", "2025-12-31", freq="D")
@@ -207,16 +225,52 @@ class TestYearOverYear:
         assert incidents == "+0.0%"
         assert avg == "+0.0%"
 
+    def test_seasons_are_not_taken_for_a_change(self):
+        # Two identical years, quiet from December to March. Measured against
+        # the whole of last year, the first quarter would look like a fall of a third.
+        def year(number: int, through: str) -> list:
+            days = pd.date_range(f"{number}-01-01", through, freq="D")
+            return [day for day in days for _ in range(3 if day.month in (12, 1, 2, 3) else 5)]
+
+        frame = self.yearly(year(2025, "2025-12-31"), year(2026, "2026-03-31"))
+        assert compute_yoy_deltas(frame, date(2026, 3, 31)) == ("+0.0%", "+0.0%")
+
+    def test_only_the_same_days_of_last_year_are_compared(self):
+        # Last year: 10 incidents by the end of March, then 100 in November
+        prior = ["2025-02-10"] * 10 + ["2025-11-05"] * 100
+        current = ["2026-02-10"] * 20
+        assert compute_yoy_deltas(self.yearly(prior, current), date(2026, 3, 31)) == ("+100.0%", "+100.0%")
+
+    def test_last_day_of_data_is_counted_in_both_years(self):
+        # An incident late on the last day, and one on the same day last year
+        prior = ["2025-03-31 23:30"] * 4 + ["2025-04-01 00:10"]
+        current = ["2026-03-31 23:30"] * 5
+        assert compute_yoy_deltas(self.yearly(prior, current), date(2026, 3, 31)) == ("+25.0%", "+25.0%")
+
     def test_sparse_prior_year_deltas_agree(self):
         # 2 incidents on consecutive days last year, 20 by day 300 this year
         prior = ["2025-03-03", "2025-03-04"]
         current = pd.date_range("2026-01-01", periods=20, freq="15D")
         incidents, avg = compute_yoy_deltas(self.yearly(prior, current), date(2026, 10, 27))
-        assert incidents == avg == "+1116.7%"
+        assert incidents == avg == "+900.0%"
+
+    def test_leap_day_counts_in_the_total_but_not_in_the_daily_average(self):
+        # One incident a day in both years; 2028 has a 29 February, 2027 does not
+        prior = pd.date_range("2027-01-01", "2027-12-31", freq="D")
+        current = pd.date_range("2028-01-01", "2028-02-29", freq="D")
+        assert same_day_last_year(date(2028, 2, 29)) == date(2027, 2, 28)
+        assert same_day_last_year(date(2028, 3, 1)) == date(2027, 3, 1)
+        # 60 days against 59
+        assert compute_yoy_deltas(self.yearly(prior, current), date(2028, 2, 29)) == ("+1.7%", "+0.0%")
 
     def test_no_delta_without_both_years(self):
         current = pd.date_range("2026-01-01", "2026-06-30", freq="D")
         assert compute_yoy_deltas(self.yearly([], current), date(2026, 6, 30)) == (None, None)
+
+    def test_no_delta_until_enough_of_the_year_has_data(self):
+        prior = pd.date_range("2025-01-01", "2025-12-31", freq="D")
+        current = pd.date_range("2026-01-01", "2026-02-28", freq="D")  # 59 days
+        assert compute_yoy_deltas(self.yearly(prior, current), date(2026, 2, 28)) == (None, None)
 
 
 class TestCategoricalFormatting:
@@ -415,7 +469,27 @@ class TestRefreshingCache:
         clock.now += 99
         assert cache.get(load) == ("first", None)
         clock.now += 1
+        # Due: the refresh runs behind the old value, which is what this call gets
+        assert cache.get(load) == ("first", None)
+        assert cache.wait(timeout=5)
         assert cache.get(load) == ("second", None)
+
+    def test_refresh_keeps_nobody_waiting(self, cache, clock):
+        cache.get(loader("first"))
+        clock.now += 100
+        release = threading.Event()
+
+        def slow_refresh():
+            release.wait(timeout=5)
+            return "second"
+
+        # Neither the caller that sets the refresh off nor one that comes during it waits
+        assert cache.get(slow_refresh) == ("first", None)
+        assert cache.get(loader()) == ("first", None)
+        assert not cache.wait(timeout=0)  # still running
+        release.set()
+        assert cache.wait(timeout=5)
+        assert cache.get(loader()) == ("second", None)
 
     def test_failed_refresh_keeps_the_previous_value(self, cache, clock):
         down = RuntimeError("portal down")
@@ -423,24 +497,72 @@ class TestRefreshingCache:
         cache.get(load)
 
         clock.now += 100
+        assert cache.get(load) == ("first", None)
+        assert cache.wait(timeout=5)
         assert cache.get(load) == ("first", down)
         # Not tried again until the retry interval has passed
         clock.now += 9
         assert cache.get(load) == ("first", down)
         clock.now += 1
+        # While it is tried again the last failure still stands
+        assert cache.get(load) == ("first", down)
+        assert cache.wait(timeout=5)
         assert cache.get(load) == ("second", None)
 
     def test_first_load_failure_is_raised_and_nothing_is_kept(self, cache, clock):
-        load = loader(RuntimeError("portal down"), "first")
-        with pytest.raises(RuntimeError, match="portal down"):
+        down = RuntimeError("portal down")
+        load = loader(down, "first")
+        with pytest.raises(LoadFailedError, match="portal down") as first:
             cache.get(load)
+        assert first.value.__cause__ is down
         # The next caller is told of the same failure; the load is not run again for it...
         clock.now += 2
-        with pytest.raises(RuntimeError, match="portal down"):
+        with pytest.raises(LoadFailedError, match="portal down") as second:
             cache.get(load)
+        assert second.value.__cause__ is down
         # ...until the wait before another first load is over
         clock.now += 1
         assert cache.get(load) == ("first", None)
+
+    def test_each_caller_gets_an_error_of_its_own(self, cache):
+        # The failure is shared by every caller and thread, so it is never raised
+        # again: each raise would rewrite its traceback under the others
+        down = RuntimeError("portal down")
+        load = loader(down)
+        raised = []
+        for _ in range(2):
+            with pytest.raises(LoadFailedError) as caught:
+                cache.get(load)
+            raised.append(caught.value)
+
+        assert raised[0] is not raised[1]
+        assert raised[0].__cause__ is raised[1].__cause__ is down
+        assert down.__traceback__ is None
+
+    def test_load_that_ends_badly_still_lets_go_of_everyone(self, cache, clock, monkeypatch):
+        # Tidying up after a failed load fails as well, as it can once memory has run out
+        def out_of_memory(error):
+            raise MemoryError("nothing left")
+
+        monkeypatch.setattr(utils, "_release_frames", out_of_memory)
+        monkeypatch.setattr(threading, "excepthook", lambda args: None)  # the load thread's last words
+
+        seen = []
+
+        def session():
+            try:
+                cache.get(loader(RuntimeError("portal down")))
+            except LoadFailedError as error:
+                seen.append(str(error))
+
+        waiting = threading.Thread(target=session, daemon=True)
+        waiting.start()
+        waiting.join(timeout=5)
+        assert seen == ["portal down"]
+
+        # The cache does not go on believing that load is under way
+        clock.now += 3
+        assert cache.get(loader("first")) == ("first", None)
 
     def test_callers_waiting_for_the_first_load_share_it(self, cache):
         started, finish = threading.Event(), threading.Event()
@@ -479,7 +601,7 @@ class TestRefreshingCache:
         def session():
             try:
                 cache.get(slow_failure)
-            except RuntimeError as error:
+            except LoadFailedError as error:
                 seen.append(str(error))
 
         sessions = [threading.Thread(target=session) for _ in range(4)]
@@ -508,12 +630,17 @@ class TestRefreshingCache:
             clock.now += 60  # the attempt alone outlasts the retry interval
             raise RuntimeError("portal down")
 
-        value, error = cache.get(slow_failure)
-        assert (value, str(error)) == ("first", "portal down")
+        cache.get(slow_failure)
+        assert cache.wait(timeout=5)
         # Straight afterwards the portal is left alone (this loader would fail if run)
+        value, error = cache.get(loader())
+        assert (value, str(error)) == ("first", "portal down")
+        clock.now += 9
         assert cache.get(loader()) == ("first", error)
-        clock.now += 10
-        assert cache.get(loader("second")) == ("second", None)
+        clock.now += 1
+        cache.get(loader("second"))
+        assert cache.wait(timeout=5)
+        assert cache.get(loader()) == ("second", None)
 
     def test_kept_failure_does_not_keep_the_failed_load_in_memory(self, cache):
         class Download:
@@ -531,30 +658,19 @@ class TestRefreshingCache:
 
         cache.get(loader("first"))
         cache.expire()
-        value, error = cache.get(failing_load)
+        cache.get(failing_load)
+        assert cache.wait(timeout=5)
+        value, error = cache.get(loader())
         gc.collect()
         assert (value, str(error)) == ("first", "the feed changed")
         assert downloads[0]() is None
-
-    def test_other_callers_get_the_old_value_while_a_refresh_runs(self, cache, clock):
-        cache.get(loader("first"))
-        clock.now += 100
-        seen = []
-
-        def slow_refresh():
-            # A second session asks for the data while this refresh is under way
-            other = threading.Thread(target=lambda: seen.append(cache.get(loader())))
-            other.start()
-            other.join(timeout=5)
-            return "second"
-
-        assert cache.get(slow_refresh) == ("second", None)
-        assert seen == [("first", None)]
 
     def test_expire_makes_the_next_get_refresh(self, cache):
         load = loader("first", "second")
         cache.get(load)
         cache.expire()
+        assert cache.get(load) == ("first", None)
+        assert cache.wait(timeout=5)
         assert cache.get(load) == ("second", None)
 
 

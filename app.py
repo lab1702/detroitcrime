@@ -18,8 +18,8 @@ from constants import (
     CHART_HEIGHT, TOP_N_ITEMS,
 )
 from utils import (
-    DataNotReadyError, validate_data, safe_load_data_from_url, clean_and_filter_data,
-    compute_yoy_deltas, daily_incident_counts, dataset_cache, selection_period,
+    TRANSIENT_ERRORS, DataNotReadyError, LoadFailedError, validate_data, safe_load_data_from_url,
+    clean_and_filter_data, compute_yoy_deltas, daily_incident_counts, dataset_cache, selection_period,
 )
 from theme import inject_css, apply_dark_plotly, BLUE_ACCENT, GREEN_ACCENT, RED_ACCENT
 
@@ -55,7 +55,7 @@ def fetch_data() -> pd.DataFrame:
     return df
 
 
-def load_error_message(error: Exception) -> str:
+def load_error_message(error: BaseException) -> str:
     """Describe a failed data load for the user."""
     if isinstance(error, DataNotReadyError):
         return (
@@ -66,6 +66,9 @@ def load_error_message(error: Exception) -> str:
         return "Request timed out. The data source may be slow. Please try again."
     if isinstance(error, requests.exceptions.ConnectionError):
         return "Connection failed. Please check your internet connection and try again."
+    if isinstance(error, TRANSIENT_ERRORS):
+        # What is left of them: a download cut short, or one that could not be decoded
+        return "The download was interrupted before it finished. Please try again."
     if isinstance(error, requests.exceptions.HTTPError):
         return f"Server error: {error}. The data source may be temporarily unavailable."
     if isinstance(error, ValueError):
@@ -80,6 +83,26 @@ def format_daily_rate(per_day: float) -> str:
     category shows as 0.0043 rather than 0.0.
     """
     return f"{per_day:.1f}" if per_day >= 1 else f"{per_day:.2g}"
+
+
+def counts_chart(counts: pd.Series, accent: str) -> None:
+    """Draw value counts as horizontal bars, the largest on top.
+
+    With nothing to count (every value in the selection is missing) it says
+    so instead: Plotly Express does not take empty data.
+    """
+    if counts.empty:
+        st.info("Nothing recorded for this selection.")
+        return
+    fig = px.bar(
+        x=counts.values[::-1],
+        y=counts.index[::-1],
+        orientation="h",
+        labels={"x": "Incidents", "y": ""},
+    )
+    fig.update_layout(height=CHART_HEIGHT)
+    apply_dark_plotly(fig, accent)
+    st.plotly_chart(fig, width="stretch")
 
 
 def setup_sidebar(categories: list[str], years: list[int]) -> tuple[str, int | str]:
@@ -118,13 +141,17 @@ def overview_page() -> None:
     incidents_delta, avg_delta = None, None
     if selected_year in ("All", data_end_date.year):
         incidents_delta, avg_delta = compute_yoy_deltas(st.session_state["df_all_years"], data_end_date)
+    delta_help = (
+        "The change compares this year, from 1 January to the last day of data, "
+        "with the same days of last year."
+    )
 
     # More crime is bad news, so increases are shown in red (inverse colors).
     with col1:
         st.metric(
             "Total Incidents", f"{len(df_filtered):,}",
             delta=incidents_delta, delta_color="inverse",
-            help="Counts offenses: a report with several charges is counted once per charge.",
+            help="Counts offenses: a report with several charges is counted once per charge. " + delta_help,
         )
     with col2:
         st.metric(
@@ -132,12 +159,17 @@ def overview_page() -> None:
             delta=f"{period_start} to {period_end}", delta_color="off", delta_arrow="off",
         )
     with col3:
-        st.metric("Avg Daily", format_daily_rate(avg_daily), delta=avg_delta, delta_color="inverse")
+        st.metric(
+            "Avg Daily", format_daily_rate(avg_daily), delta=avg_delta, delta_color="inverse",
+            help=delta_help,
+        )
     with col4:
         if selected_category != "All":
             st.metric("Selected Category", selected_category)
         else:
-            st.metric("Most Common", df_filtered["offense_category"].mode()[0])
+            # Empty when no incident in the selection has a category
+            most_common = df_filtered["offense_category"].mode()
+            st.metric("Most Common", most_common.iloc[0] if not most_common.empty else "—")
 
     st.divider()
 
@@ -152,28 +184,11 @@ def overview_page() -> None:
             st.subheader(f"Top {TOP_N_ITEMS} Crime Categories")
             counts = df_filtered["offense_category"].value_counts().head(TOP_N_ITEMS)
 
-        fig_cat = px.bar(
-            x=counts.values[::-1],
-            y=counts.index[::-1],
-            orientation="h",
-            labels={"x": "Incidents", "y": ""},
-        )
-        fig_cat.update_layout(height=CHART_HEIGHT)
-        apply_dark_plotly(fig_cat, RED_ACCENT)
-        st.plotly_chart(fig_cat, width="stretch")
+        counts_chart(counts, RED_ACCENT)
 
     with right:
         st.subheader("Case Status")
-        status_counts = df_filtered["case_status"].value_counts()
-        fig_status = px.bar(
-            x=status_counts.values[::-1],
-            y=status_counts.index[::-1],
-            orientation="h",
-            labels={"x": "Incidents", "y": ""},
-        )
-        fig_status.update_layout(height=CHART_HEIGHT)
-        apply_dark_plotly(fig_status, GREEN_ACCENT)
-        st.plotly_chart(fig_status, width="stretch")
+        counts_chart(df_filtered["case_status"].value_counts(), GREEN_ACCENT)
 
     # ── Daily Trend Sparkline ───────────────────────────────────────────────────
     st.subheader("Daily Incidents")
@@ -194,23 +209,29 @@ def overview_page() -> None:
 
 def main() -> None:
     """Load data, populate session state for child pages, and run navigation."""
+    # The page scripts live in views/, not pages/. Streamlit treats a pages/
+    # folder next to this file as an app of its own until st.navigation has
+    # been called once: a first visitor arriving on a page's URL would be
+    # given that script alone, without the data this file loads for it.
     pg = st.navigation([
         st.Page(overview_page, title="Overview", default=True),
-        st.Page("pages/2_Trends.py", title="Trends"),
-        st.Page("pages/3_Geography.py", title="Geography"),
-        st.Page("pages/4_Analysis.py", title="Pivot Analysis"),
-        st.Page("pages/5_Map.py", title="Map"),
+        st.Page("views/2_Trends.py", title="Trends"),
+        st.Page("views/3_Geography.py", title="Geography"),
+        st.Page("views/4_Analysis.py", title="Pivot Analysis"),
+        st.Page("views/5_Map.py", title="Map"),
     ])
 
-    # The dataset is refreshed once it is DATA_CACHE_TTL old. If that refresh
-    # fails, the previous copy stays in use and the failure is reported. The
-    # download runs on the cache's own thread and this only waits for it, so a
-    # click that interrupts this script does not throw the download away.
+    # The dataset is refreshed once it is DATA_CACHE_TTL old. The refresh runs
+    # in the background while the previous copy stays in use; if it fails, the
+    # failure is reported. Only the first download is waited for, and it runs
+    # on the cache's own thread, so a click that interrupts this script does
+    # not throw it away.
     try:
         with st.spinner("Downloading Detroit crime data..."):
             df, refresh_error = dataset_cache().get(fetch_data)
-    except Exception as e:
-        st.error(load_error_message(e))
+    except LoadFailedError as e:
+        # One of these is raised for each visitor; the failure itself is its cause
+        st.error(load_error_message(e.__cause__))
         return
 
     if refresh_error is not None:

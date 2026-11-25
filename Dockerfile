@@ -8,6 +8,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Run as an unprivileged user. It gets a home directory because Streamlit and
+# the plotting libraries keep small settings files there.
+RUN useradd --create-home --uid 1000 app
+USER app
+
 EXPOSE 8501
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \

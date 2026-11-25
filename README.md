@@ -89,7 +89,7 @@ The application will be available at `http://localhost:8502`
 ```
 detroitcrime/
 ├── app.py                 # Entry point: data loading, sidebar filters, Overview page
-├── pages/
+├── views/                 # Page scripts, run by app.py (not named pages/: see Development Notes)
 │   ├── 2_Trends.py        # Daily trend, year over year, hour x day heatmap, forecast
 │   ├── 3_Geography.py     # Neighborhoods, precincts, districts, zip codes, locations
 │   ├── 4_Analysis.py      # Interactive pivot table
@@ -111,8 +111,8 @@ detroitcrime/
 
 ### Data Loading (`fetch_data()` and `dataset_cache()`)
 - Fetches data from Detroit Open Data Portal, retrying network errors, rate limiting and server errors
-- Keeps the data for 24 hours, then refreshes it; if a refresh fails, the previous copy stays in use and a warning is shown
-- Downloads on a background thread shared by every session: visitors who arrive during a download wait for that one, and a click while waiting does not restart it
+- Keeps the data for 24 hours, then refreshes it in the background: nobody waits for a refresh, the previous copy is shown until the new one has arrived, and the new one appears on the next rerun after that. If a refresh fails, the previous copy stays in use and a warning is shown
+- Downloads on a background thread shared by every session: visitors who arrive during the first download wait for that one, and a click while waiting does not restart it
 - A failed first load is reported to every visitor and tried again after a minute, rather than repeated for each of them
 - Cleans and filters data for quality
 - Removes invalid coordinates and recent incomplete data
@@ -121,11 +121,11 @@ detroitcrime/
 
 The dashboard has five pages, all driven by the sidebar filters:
 
-1. **Overview**: KPI cards with year-over-year change (shown for all years and for the current year), top categories (or offense descriptions when a category is selected), case status, daily incidents. The daily average is measured over the whole selected period, including days without incidents
+1. **Overview**: KPI cards with year-over-year change (shown for all years and for the current year; it compares 1 January to the last day of data with the same days of last year), top categories (or offense descriptions when a category is selected), case status, daily incidents. The daily average is measured over the whole selected period, including days without incidents
 2. **Trends**: Daily incidents, year over year with a projection for the latest year, hour of day x day of week heatmap, 1-year Prophet forecast with holiday annotations. The forecast is fitted on every year of the selected category, so the Year filter does not apply to it
 3. **Geography**: Top neighborhoods, police precincts, council districts, zip codes and intersections
 4. **Pivot Analysis**: Interactive pivot table with customizable rows and columns. Incidents with no value for a chosen field cannot be placed in the table; a note under it says how many
-5. **Map**: Incident locations as colour-coded points (sampled above 250,000 points) or as a density heatmap
+5. **Map**: Incident locations as colour-coded points (sampled above 50,000 points) or as a density heatmap, which always uses every incident. The chosen view is kept while other pages are visited
 
 ### Advanced Features
 
@@ -169,12 +169,15 @@ The application implements several data quality measures:
 - Excludes the feed's last day, and anything dated after it, to avoid incomplete data. The last day is the latest one with at least 10% of a typical day's incidents, so a lone mistyped date is not taken for it
 - Filters data from 2018-01-01 onwards for consistency
 - Trims padded text values so the same value is not counted twice, and treats a value that is only padding as missing
+- Reads the feed's day-of-week and hour-of-day fields as numbers, and treats a value that is not a number as missing
 - Replaces bytes that are not valid UTF-8 instead of refusing the file
 
 ## Development Notes
 
 - Dependencies are pinned to tested version ranges in `requirements.txt`; the Docker image uses `python:3.15`
 - Run the tests with `pip install -r requirements-dev.txt` then `pytest`
+- The page scripts are in `views/` and must not be moved to a folder named `pages/`. Streamlit runs the scripts of a `pages/` folder on their own until `st.navigation` has been called once, so the first visitor to a new server who arrived on a page's URL would get that page without the data `app.py` loads
+- The Docker image runs the app as an unprivileged user (`app`)
 - Follows Streamlit best practices for layout and caching
 - Implements error handling for API failures
 - Responsive design with wide layout configuration

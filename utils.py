@@ -20,7 +20,7 @@ import streamlit as st
 from constants import (
     DATA_CACHE_TTL, DATA_FIRST_LOAD_RETRY_INTERVAL, DATA_RETRY_INTERVAL, DAY_LABELS,
     LOCAL_TIMEZONE, MAX_UNPARSEABLE_DATE_SHARE, MIN_LAST_DAY_SHARE, MIN_PROJECTION_DAYS,
-    REQUIRED_COLUMNS, TEXT_COLUMNS,
+    NUMBER_COLUMNS, REQUIRED_COLUMNS, TEXT_COLUMNS,
 )
 
 logger = logging.getLogger(__name__)
@@ -234,6 +234,15 @@ class _Load:
         self.error: Optional[BaseException] = None
 
 
+class LoadFailedError(Exception):
+    """A load failed and there is no earlier value to use in its place.
+
+    Raised by `RefreshingCache.get`, a new one for each caller. The failure
+    itself, which every caller is told of, is its `__cause__`: that one object
+    is shared between threads, so it is never raised again.
+    """
+
+
 class RefreshingCache:
     """Keeps the last good result of an expensive load and refreshes it when stale.
 
@@ -242,11 +251,13 @@ class RefreshingCache:
     callers get the old value together with the error, and the load is not
     tried again until `retry_interval` has passed.
 
-    Loads run one at a time on a thread of the cache's own, and callers wait
-    for the result. So a load always runs to the end and is kept, even when
-    the caller that started it is interrupted (Streamlit stops a session's
-    script as soon as its user clicks something), and callers that arrive
-    during a load share it rather than start their own.
+    Loads run one at a time on a thread of the cache's own. So a load always
+    runs to the end and is kept, even when the caller that started it is
+    interrupted (Streamlit stops a session's script as soon as its user clicks
+    something), and callers that arrive during a load share it rather than
+    start their own. Only the first load is waited for: a refresh runs behind
+    the old value, which every caller, the one that set it off included, gets
+    straight away. The new value is returned once the refresh has ended.
 
     Args:
         ttl: Age at which the value is due for a refresh
@@ -276,32 +287,40 @@ class RefreshingCache:
     def get(self, loader: Callable[[], Any]) -> Tuple[Any, Optional[BaseException]]:
         """Return (value, error), loading or refreshing with `loader` when due.
 
-        `error` is None when the value is current. When a refresh has failed it
-        is that failure, and the value is the previous one. With no previous
-        value to fall back on, a failed load raises: for every caller that
-        waited for it, and for those that come after until it is due another
-        try.
+        `error` is None when the value is current, or is being refreshed for
+        the first time since it was. When a refresh has failed it is that
+        failure, and the value is the previous one. A refresh is not waited
+        for: the previous value is returned while it runs.
+
+        With no previous value there is nothing to return, so the load is
+        waited for, and if it fails LoadFailedError is raised: for every
+        caller that waited, and for those that come after until it is due
+        another try.
+
+        Raises:
+            LoadFailedError: the load failed with no earlier value to use;
+                its `__cause__` is the failure
         """
         with self._lock:
             if self._has_value and self._clock() - self._loaded_at < self._ttl:
                 return self._value, None
 
             load = self._load
-            if load is not None:
-                # A refresh is under way: use what there is rather than wait
-                if self._has_value:
-                    return self._value, self._error
-            else:
+            if load is None:
                 retry_interval = self._retry_interval if self._has_value else self._first_retry_interval
                 if self._failed_at is not None and self._clock() - self._failed_at < retry_interval:
                     if self._has_value:
                         return self._value, self._error
-                    raise self._error.with_traceback(None)
+                    raise LoadFailedError(str(self._error)) from self._error
                 load = _Load()
                 threading.Thread(
                     target=self._run, args=(loader, load), name="refreshing-cache-load", daemon=True
                 ).start()
                 self._load = load
+
+            # A refresh is under way: use what there is rather than wait
+            if self._has_value:
+                return self._value, self._error
 
         load.done.wait()
         if load.error is None:
@@ -309,31 +328,48 @@ class RefreshingCache:
         with self._lock:
             if self._has_value:
                 return self._value, load.error
-        # A kept exception is raised again and again; start its traceback afresh
-        raise load.error.with_traceback(None)
+        raise LoadFailedError(str(load.error)) from load.error
 
     def _run(self, loader: Callable[[], Any], load: _Load) -> None:
         """Run one load on the cache's thread and record how it ended."""
         try:
-            load.value = loader()
-        except BaseException as error:  # whatever stops the load is its outcome
-            _release_frames(error)
-            load.error = error
+            try:
+                load.value = loader()
+            except BaseException as error:  # whatever stops the load is its outcome
+                load.error = error
+                _release_frames(error)
+        finally:
+            # Whatever went wrong above, nobody is left waiting for this load
+            # and the next one is free to start
+            try:
+                with self._lock:
+                    self._load = None
+                    # Timed from the end of the attempt: a failure that was slow
+                    # to show itself still earns the full wait before the next try
+                    now = self._clock()
+                    if load.error is None:
+                        self._value, self._has_value = load.value, True
+                        self._loaded_at, self._failed_at, self._error = now, None, None
+                    else:
+                        self._failed_at, self._error = now, load.error
+            finally:
+                load.done.set()
 
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        """Wait for the load under way, if there is one, to end.
+
+        Returns:
+            False if `timeout` (in seconds) passed first, True otherwise
+        """
         with self._lock:
-            # Timed from the end of the attempt: a failure that was slow to
-            # show itself still earns the full wait before the next try
-            now = self._clock()
-            if load.error is None:
-                self._value, self._has_value = load.value, True
-                self._loaded_at, self._failed_at, self._error = now, None, None
-            else:
-                self._failed_at, self._error = now, load.error
-            self._load = None
-        load.done.set()
+            load = self._load
+        return load is None or load.done.wait(timeout)
 
     def expire(self) -> None:
-        """Make the next `get` load again, whatever the age of the value or of a failure."""
+        """Make the next `get` load again, whatever the age of the value or of a failure.
+
+        As with any refresh, that `get` still returns the value there is.
+        """
         with self._lock:
             self._loaded_at = self._clock() - self._ttl
             self._failed_at = None
@@ -418,6 +454,13 @@ def clean_and_filter_data(df: pd.DataFrame, min_date: str,
         latitude=pd.to_numeric(df['latitude'], errors='coerce'),
         longitude=pd.to_numeric(df['longitude'], errors='coerce'),
     ).dropna(subset=['latitude', 'longitude'])
+
+    # The same goes for the feed's day and hour numbers. Left as text they
+    # match none of the days and hours the charts lay out, and the heatmap
+    # comes out empty; a cell that is not a number is missing instead.
+    for column in NUMBER_COLUMNS:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors='coerce')
 
     occurred = parse_feed_timestamps(df['incident_occurred_at'])
     df['incident_occurred_at'] = occurred.dt.tz_convert(local_timezone).dt.tz_localize(None)
@@ -521,39 +564,59 @@ def project_full_year(count_to_date: int, as_of: date) -> Optional[float]:
     return count_to_date * days_in_year(as_of.year) / days_elapsed
 
 
+def same_day_last_year(day: date) -> date:
+    """The same calendar day one year earlier; 29 February becomes 28 February."""
+    try:
+        return day.replace(year=day.year - 1)
+    except ValueError:
+        return day.replace(year=day.year - 1, day=28)
+
+
 def compute_yoy_deltas(df_filtered: pd.DataFrame, as_of: date) -> Tuple[Optional[str], Optional[str]]:
     """
     Compute year-over-year deltas for Total Incidents and Avg Daily.
 
     The current year is the year of `as_of` (the last day the data covers).
-    Both years are measured over calendar days: days elapsed through `as_of`
-    for the current year, and the full year for the prior one.
+    It is compared like for like: 1 January through `as_of` against the same
+    days of the year before. Measuring the year so far against the whole of
+    the last one would show the seasons as a change (a quiet winter as a
+    fall), because the months still to come are not the same as those past.
+
+    The two deltas differ only around a leap day, when one of the two spans
+    is a day longer: the total counts that day, the daily average does not.
 
     Args:
-        df_filtered: Incidents for the current filter selection
+        df_filtered: Incidents for the current filter selection, with their
+            local time in `incident_occurred_at`
         as_of: Last day the full dataset covers
 
     Returns:
-        (incidents_delta, avg_delta) as formatted strings, or None when a
-        year has no incidents or too little of the current year has elapsed
+        (incidents_delta, avg_delta) as formatted strings, or None when
+        either span has no incidents or fewer than MIN_PROJECTION_DAYS of the
+        current year have data
     """
-    current_year = as_of.year
-    prior_year = current_year - 1
+    cy_days = as_of.timetuple().tm_yday
+    if cy_days < MIN_PROJECTION_DAYS:
+        return None, None
+    prior_as_of = same_day_last_year(as_of)
+    py_days = prior_as_of.timetuple().tm_yday
 
-    counts_by_year = df_filtered["incident_year"].value_counts()
-    cy_count = int(counts_by_year.get(current_year, 0))
-    py_count = int(counts_by_year.get(prior_year, 0))
+    def incidents_through(last_day: date) -> int:
+        """Incidents from 1 January of `last_day`'s year through that day."""
+        occurred = df_filtered["incident_occurred_at"]
+        start = pd.Timestamp(last_day.year, 1, 1)
+        end = pd.Timestamp(last_day) + pd.Timedelta(days=1)
+        return int(((occurred >= start) & (occurred < end)).sum())
+
+    cy_count = incidents_through(as_of)
+    py_count = incidents_through(prior_as_of)
     if cy_count == 0 or py_count == 0:
         return None, None
 
-    cy_projected = project_full_year(cy_count, as_of)
-    if cy_projected is None:
-        return None, None
+    incidents_delta = f"{(cy_count - py_count) / py_count * 100:+.1f}%"
 
-    incidents_delta = f"{(cy_projected - py_count) / py_count * 100:+.1f}%"
-
-    cy_avg = cy_count / as_of.timetuple().tm_yday
-    py_avg = py_count / days_in_year(prior_year)
+    cy_avg = cy_count / cy_days
+    py_avg = py_count / py_days
     avg_delta = f"{(cy_avg - py_avg) / py_avg * 100:+.1f}%"
 
     return incidents_delta, avg_delta

@@ -58,6 +58,14 @@ def make_raw_feed(start="2024-06-01", end="2026-03-31 23:00", per_day=8, seed=0)
     })
 
 
+def clean_feed(raw: pd.DataFrame) -> pd.DataFrame:
+    """Clean a raw feed with the settings app.py uses."""
+    return clean_and_filter_data(
+        raw.copy(), MIN_DATE,
+        (DETROIT_LAT_MIN, DETROIT_LAT_MAX), (DETROIT_LON_MIN, DETROIT_LON_MAX),
+    )
+
+
 @pytest.fixture(scope="session")
 def raw_feed() -> pd.DataFrame:
     return make_raw_feed()
@@ -65,10 +73,7 @@ def raw_feed() -> pd.DataFrame:
 
 @pytest.fixture(scope="session")
 def clean_df(raw_feed) -> pd.DataFrame:
-    return clean_and_filter_data(
-        raw_feed.copy(), MIN_DATE,
-        (DETROIT_LAT_MIN, DETROIT_LAT_MAX), (DETROIT_LON_MIN, DETROIT_LON_MAX),
-    )
+    return clean_feed(raw_feed)
 
 
 def make_page_state(full: pd.DataFrame, category: str = "All", year="All") -> dict:
