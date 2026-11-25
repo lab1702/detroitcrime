@@ -60,6 +60,13 @@ DATA_RETRY_INTERVAL = 900  # 15 minutes
 # A failed first load leaves nothing to show, so it is tried again sooner.
 # Until then every visitor is shown the failure rather than repeating the download.
 DATA_FIRST_LOAD_RETRY_INTERVAL = 60  # 1 minute
+# Both are for a failure that can pass (the network, a busy portal). One that
+# would only repeat, such as a feed that has lost a column or a refresh refused
+# as shrunken, waits twice as long after each such failure in a row, up to
+# this: every try is a whole download. It is not longer because such a failure
+# can pass after all: the portal empties the dataset for hours while it reloads
+# it, and an export made then looks like a feed that has shrunk.
+DATA_MAX_RETRY_INTERVAL = 21600  # 6 hours
 # How often an open page that is waiting for a download asks whether it has
 # ended, so that it can show the result without the user clicking anything.
 DATA_POLL_INTERVAL = 5
@@ -107,6 +114,16 @@ CODE_LABEL_PREFIXES = {
     'zip_code': '',
     'police_precinct': 'Precinct',
     'council_district': 'District',
+}
+
+# Holidays are named beside their marks on the forecast, where there is room
+# for about this many characters. The official names that are longer have a
+# short one here; any other long name is cut at a word.
+MAX_HOLIDAY_LABEL_LENGTH = 16
+HOLIDAY_SHORT_NAMES = {
+    "Martin Luther King Jr. Day": "MLK Day",
+    "Washington's Birthday": "Presidents' Day",
+    "Juneteenth National Independence Day": "Juneteenth",
 }
 
 # Day of week labels. The feed numbers days ISO-style: 1=Monday ... 7=Sunday.

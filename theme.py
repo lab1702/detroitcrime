@@ -16,6 +16,11 @@ TEAL_ACCENT = "#00bfa5"      # Secondary positive
 CARD_BG = "#1a1f2e"
 CARD_BORDER = "#2d3548"
 
+# Key of the container around the KPI card that shows a category name.
+# Streamlit gives a keyed container the class "st-key-<key>", which the CSS
+# below styles that one card by.
+CATEGORY_CARD_KEY = "category_card"
+
 CUSTOM_CSS = """
 <style>
     /* KPI metric cards */
@@ -36,6 +41,17 @@ CUSTOM_CSS = """
         color: #e0e0e0;
         font-size: 1.8rem;
         font-weight: 700;
+    }
+    /* The card that shows a category name: smaller, and wrapped over two
+       lines if need be, where a long name would otherwise be cut off */
+    .st-key-category_card div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+        font-size: 1.15rem;
+        line-height: 1.35;
+    }
+    .st-key-category_card [data-testid="stMetricValue"] div,
+    .st-key-category_card [data-testid="stMetricValue"] p {
+        white-space: normal;
+        overflow-wrap: anywhere;
     }
 
     /* Page headers */

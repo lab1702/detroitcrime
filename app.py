@@ -21,10 +21,10 @@ from constants import (
 )
 from utils import (
     NO_CHANGE, TRANSIENT_ERRORS, DataNotReadyError, LoadFailedError, validate_data, safe_load_data_from_url,
-    clean_and_filter_data, compute_yoy_deltas, daily_incident_counts, dataset_cache, is_transient_error,
-    selection_period,
+    clean_and_filter_data, compute_yoy_deltas, daily_incident_counts, dataset_cache, format_daily_rate,
+    is_transient_error, selection_period,
 )
-from theme import inject_css, apply_dark_plotly, BLUE_ACCENT, GREEN_ACCENT, RED_ACCENT
+from theme import inject_css, apply_dark_plotly, BLUE_ACCENT, CATEGORY_CARD_KEY, GREEN_ACCENT, RED_ACCENT
 
 # Configure page
 st.set_page_config(
@@ -108,15 +108,6 @@ def change_style(delta: str | None) -> dict[str, str]:
     if delta == NO_CHANGE:
         return {"delta_color": "off", "delta_arrow": "off"}
     return {"delta_color": "inverse"}
-
-
-def format_daily_rate(per_day: float) -> str:
-    """Incidents per day for the KPI card.
-
-    One decimal place, or two significant digits below one a day, so a rare
-    category shows as 0.0043 rather than 0.0.
-    """
-    return f"{per_day:.1f}" if per_day >= 1 else f"{per_day:.2g}"
 
 
 def counts_chart(counts: pd.Series, accent: str) -> None:
@@ -221,7 +212,10 @@ def overview_page() -> None:
             "Avg Daily", format_daily_rate(avg_daily), delta=avg_delta, **change_style(avg_delta),
             help=delta_help,
         )
-    with col4:
+    # This card holds a name, not a number, and most names are longer than the
+    # card is wide at the size numbers are shown in. The key lets the theme set
+    # it smaller and wrap it, where it would otherwise be cut off (see theme.py).
+    with col4, st.container(key=CATEGORY_CARD_KEY):
         if selected_category != "All":
             st.metric("Selected Category", selected_category)
         else:
@@ -295,7 +289,8 @@ def main() -> None:
         # The cache leaves a failed first load alone for a while, then tries
         # again for the next run that asks. A failure that can pass is asked
         # about again from here once that time is up; one that would only
-        # repeat (and may cost a whole download each time) waits for a reload.
+        # repeat (and may cost a whole download each time) waits for a reload,
+        # and the cache makes it wait longer each time.
         if is_transient_error(failure):
             retry_at = time.monotonic() + DATA_FIRST_LOAD_RETRY_INTERVAL
             update_when(
@@ -310,10 +305,11 @@ def main() -> None:
             + load_error_message(refresh_error)
         )
 
-    # A refresh is running behind the copy shown here (wait returns False while
-    # one is): say so, and draw the page again when it has ended, with the new
-    # data or with the reason there is none.
-    if not cache.wait(timeout=0):
+    # A refresh is running behind the copy shown here: say so, and draw the
+    # page again when it has ended, with the new data or with the reason there
+    # is none. The same goes for one that ended after this run was handed its
+    # copy, which asking only whether one is running would miss.
+    if not cache.up_to_date(df, refresh_error):
         update_when(
             lambda: cache.wait(timeout=0),
             "Newer data is being downloaded. This page will update when it is ready.",

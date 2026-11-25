@@ -13,12 +13,12 @@ import requests
 
 import utils
 from constants import REQUIRED_COLUMNS
-from theme import BLUE_ACCENT, RED_ACCENT, apply_dark_plotly
+from theme import BLUE_ACCENT, CATEGORY_CARD_KEY, CUSTOM_CSS, RED_ACCENT, apply_dark_plotly
 from utils import (
     DataNotReadyError, LoadFailedError, RefreshingCache, clean_and_filter_data, code_labels,
     compute_yoy_deltas, daily_incident_counts, day_labels, format_categorical_series, format_change,
-    numeric_codes, part_year_note, partial_years, project_full_year, refuse_shrunken_refresh,
-    safe_load_data_from_url, same_day_last_year, selection_period,
+    format_daily_rate, holiday_label, numeric_codes, part_year_note, partial_years, project_full_year,
+    refuse_shrunken_refresh, safe_load_data_from_url, same_day_last_year, selection_period,
 )
 
 BOUNDS = ((42.0, 43.0), (-84.0, -82.0))
@@ -383,6 +383,59 @@ class TestCategoricalFormatting:
         assert day_labels([1, 2.0, 7]) == ["Monday", "Tuesday", "Sunday"]
         assert day_labels([0, 8]) == ["0", "8"]
 
+    def test_holiday_names_fit_beside_their_marks(self):
+        assert holiday_label("Labor Day") == "Labor Day"
+        assert holiday_label("Independence Day") == "Independence Day"
+        # Cut to nine characters, these two used to read "Juneteent..." and "Martin Lu..."
+        assert holiday_label("Juneteenth National Independence Day") == "Juneteenth"
+        assert holiday_label("Martin Luther King Jr. Day") == "MLK Day"
+        assert holiday_label("Washington's Birthday") == "Presidents' Day"
+
+    def test_unfamiliar_long_holiday_name_is_cut_at_a_word(self):
+        assert holiday_label("Some Very Long Holiday Name") == "Some Very Long…"
+        assert holiday_label("Supercalifragilisticexpialidocious Day") == "Supercalifragil…"
+        assert all(len(holiday_label(name)) <= 16 for name in ("A Day Exactly Sixteen", "Sixteen Letters!!", "Day"))
+
+
+class TestDailyRate:
+    def test_one_decimal_from_one_a_day_up(self):
+        assert format_daily_rate(20.04) == "20.0"
+        assert format_daily_rate(1.0) == "1.0"
+        assert format_daily_rate(1.04) == "1.0"
+
+    def test_two_significant_digits_below_one_a_day(self):
+        assert format_daily_rate(0.95) == "0.95"
+        assert format_daily_rate(0.5) == "0.5"
+        assert format_daily_rate(3 / 668) == "0.0045"
+
+    def test_rate_that_rounds_up_to_one_reads_like_one(self):
+        # ".2g" gave a bare "1" here, next to "1.0" for a rate just above
+        assert format_daily_rate(0.996) == "1.0"
+        assert format_daily_rate(0.9999) == "1.0"
+
+    def test_very_small_rate_is_written_out(self):
+        assert format_daily_rate(0.00009) == "0.00009"  # not "9e-05"
+        assert format_daily_rate(0.0) == "0"
+
+
+class TestValidation:
+    def test_missing_columns_are_named_even_when_none_are_there(self):
+        # A frame loaded with none of its columns is empty too; what it lacks is the news
+        with pytest.raises(ValueError, match="Missing required columns"):
+            utils.validate_data(pd.DataFrame(index=range(3)))
+
+    def test_no_rows_is_an_error(self):
+        with pytest.raises(ValueError, match="empty"):
+            utils.validate_data(pd.DataFrame(columns=REQUIRED_COLUMNS))
+        with pytest.raises(ValueError, match="empty"):
+            utils.validate_data(None)
+
+
+class TestTheme:
+    def test_category_card_is_styled_by_the_key_the_page_gives_it(self):
+        # The page and the stylesheet each name the card; they have to agree
+        assert f".st-key-{CATEGORY_CARD_KEY} " in CUSTOM_CSS
+
 
 CSV_BODY = b"latitude,offense_category\n42.3,ARSON\n42.4,FRAUD\n"
 
@@ -478,10 +531,36 @@ class TestDownload:
         assert len(portal) == 1
 
     def test_unparseable_file_is_not_downloaded_again(self, portal):
-        portal.extend([FakeResponse(b""), FakeResponse()])
-        with pytest.raises(pd.errors.EmptyDataError):
+        # A quoted value that never ends: the same file would fail the same way
+        portal.extend([FakeResponse(b'latitude,offense_category\n42.3,"ARSON\n'), FakeResponse()])
+        with pytest.raises(pd.errors.ParserError):
             safe_load_data_from_url(URL)
         assert len(portal) == 1
+
+    @pytest.mark.parametrize("body", [
+        b"",
+        b"\n\n",
+        b"latitude,offense_category\n",
+        b"X,Y,ESRI_OID\n",
+        b"The dataset is being updated\n",
+    ], ids=["no bytes", "blank lines", "header only", "header only, other columns", "one line of text"])
+    def test_file_with_no_rows_is_not_ready_and_is_tried_again(self, portal, body):
+        # The portal empties the dataset while it reloads it; an export made
+        # then has no rows. That passes, unlike a feed that has changed.
+        portal.extend([FakeResponse(body), FakeResponse(body)])
+        with pytest.raises(DataNotReadyError, match="empty file|no rows"):
+            safe_load_data_from_url(URL, max_retries=2, usecols=REQUIRED_COLUMNS)
+        assert portal == []
+        assert utils.is_transient_error(DataNotReadyError("the portal sent a file with no rows in it"))
+
+    def test_file_with_rows_and_none_of_the_columns_is_left_to_validation(self, portal):
+        # Rows, but under other names: the feed has changed, and waiting will
+        # not change it back. It is loaded once and reported by column.
+        portal.extend([FakeResponse(b"X,Y,ESRI_OID\n1,2,3\n4,5,6\n"), FakeResponse()])
+        df = safe_load_data_from_url(URL, usecols=REQUIRED_COLUMNS)
+        assert len(portal) == 1
+        with pytest.raises(ValueError, match="Missing required columns: .*'latitude'.*'zip_code'"):
+            utils.validate_data(df)
 
     def test_status_document_instead_of_csv_is_not_ready(self, portal):
         status = FakeResponse(b'{"status":"ExportingData","progressInPercent":40}', content_type="application/json")
@@ -825,6 +904,135 @@ class TestRefreshingCache:
         assert cache.wait(timeout=5)
         assert cache.get(load) == ("second", None)
 
+    @staticmethod
+    def attempts_over(cache: RefreshingCache, clock: Clock, seconds: int, load, step: int = 5) -> list[float]:
+        """When, from now, `load` is run if the cache is asked every `step` seconds."""
+        started, ran = clock.now, []
+
+        def counted():
+            ran.append(clock.now - started)
+            return load()
+
+        for _ in range(seconds // step):
+            try:
+                cache.get(counted)
+            except LoadFailedError:
+                pass
+            assert cache.wait(timeout=5)
+            clock.now += step
+        return ran
+
+    def test_refresh_that_would_only_repeat_is_tried_less_and_less_often(self, clock):
+        # A feed that has lost a column fails the same way on every try, and
+        # each try is a whole download: every 10 seconds, it was 100 of them here
+        def changed_feed():
+            raise ValueError("the feed changed")
+
+        cache = RefreshingCache(
+            ttl=100, retry_interval=10, clock=clock, can_pass=lambda error: not isinstance(error, ValueError),
+        )
+        cache.get(loader("first"))
+        clock.now += 100
+        # The wait doubles each time, and stops growing at the time to live
+        assert self.attempts_over(cache, clock, 1000, changed_feed) == [
+            0, 10, 30, 70, 150, 250, 350, 450, 550, 650, 750, 850, 950,
+        ]
+        value, error = cache.get(loader())
+        assert (value, str(error)) == ("first", "the feed changed")
+
+    def test_wait_for_a_repeating_failure_stops_growing_at_its_limit(self, clock):
+        def changed_feed():
+            raise ValueError("the feed changed")
+
+        cache = RefreshingCache(
+            ttl=1000, retry_interval=10, clock=clock, can_pass=lambda error: False, max_retry_interval=40,
+        )
+        cache.get(loader("first"))
+        clock.now += 1000
+        # 10, 20, then 40 at a time
+        assert self.attempts_over(cache, clock, 200, changed_feed) == [0, 10, 30, 70, 110, 150, 190]
+
+    def test_failure_that_can_pass_is_tried_again_at_the_usual_interval(self, clock):
+        def portal_down():
+            raise ConnectionError("portal down")
+
+        cache = RefreshingCache(
+            ttl=100, retry_interval=10, clock=clock, can_pass=lambda error: not isinstance(error, ValueError),
+        )
+        cache.get(loader("first"))
+        clock.now += 100
+        assert self.attempts_over(cache, clock, 50, portal_down) == [0, 10, 20, 30, 40]
+
+    def test_wait_starts_over_once_a_failure_is_not_the_repeating_kind(self, clock):
+        failures = [ValueError("changed"), ValueError("changed"), ConnectionError("down"), ValueError("changed")]
+
+        def fail():
+            raise failures.pop(0) if failures else ValueError("changed")
+
+        cache = RefreshingCache(
+            ttl=1000, retry_interval=10, clock=clock, can_pass=lambda error: not isinstance(error, ValueError),
+        )
+        cache.get(loader("first"))
+        clock.now += 1000
+        # 10 after the first, 20 after the second, then the usual 10 after the
+        # fault on the line and after the first repeating failure that follows it
+        assert self.attempts_over(cache, clock, 80, fail) == [0, 10, 30, 40, 50, 70]
+
+    def test_repeating_first_load_failure_backs_off_from_the_first_load_interval(self, clock):
+        def changed_feed():
+            raise ValueError("the feed changed")
+
+        cache = RefreshingCache(
+            ttl=100, retry_interval=50, first_retry_interval=5, clock=clock, can_pass=lambda error: False,
+        )
+        assert self.attempts_over(cache, clock, 100, changed_feed) == [0, 5, 15, 35, 75]
+
+    def test_a_good_load_ends_the_long_wait(self, clock):
+        results = [ValueError("changed"), ValueError("changed"), "second", ValueError("changed"), ValueError("changed")]
+
+        def load():
+            result = results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        cache = RefreshingCache(ttl=100, retry_interval=10, clock=clock, can_pass=lambda error: False)
+        cache.get(loader("first"))
+        clock.now += 100
+        # Fails at 0 and 10, loads at 30; due again at 130, and the failure
+        # then is left alone for the usual 10, not for twice the last wait
+        assert self.attempts_over(cache, clock, 150, load) == [0, 10, 30, 130, 140]
+
+    def test_up_to_date_until_a_load_starts_or_ends(self, cache, clock):
+        value, error = cache.get(loader("first"))
+        assert cache.up_to_date(value, error)
+
+        clock.now += 100
+        release = threading.Event()
+
+        def slow_refresh():
+            release.wait(timeout=5)
+            return "second"
+
+        value, error = cache.get(slow_refresh)
+        assert not cache.up_to_date(value, error)  # a refresh is under way
+        release.set()
+        assert cache.wait(timeout=5)
+        # Nothing is running now, but what the caller was given has been replaced.
+        # A caller that only asked whether a load was running would never know.
+        assert cache.wait(timeout=0)
+        assert not cache.up_to_date(value, error)
+        assert cache.up_to_date(*cache.get(loader()))
+
+    def test_not_up_to_date_once_a_refresh_has_failed(self, cache, clock):
+        value, error = cache.get(loader("first"))
+        clock.now += 100
+        assert cache.get(loader(RuntimeError("portal down"))) == (value, None)
+        assert cache.wait(timeout=5)
+        # The value is the same one, but there is a failure to report with it now
+        assert not cache.up_to_date(value, None)
+        assert cache.up_to_date(*cache.get(loader()))
+
 
 class TestShrunkenRefresh:
     @staticmethod
@@ -851,6 +1059,11 @@ class TestShrunkenRefresh:
             value, error = cache.get(lambda: self.rows(100))
             assert len(value) == 1000
             assert "only 100 usable incidents" in str(error)
+            # A refused refresh would be refused again: it is one of the
+            # failures the cache tries again less and less often
+            assert cache._can_pass is utils.is_transient_error
+            assert not utils.is_transient_error(error)
+            assert cache._max_retry_interval == utils.DATA_MAX_RETRY_INTERVAL < utils.DATA_CACHE_TTL
         finally:
             utils.st.cache_resource.clear()
 

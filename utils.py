@@ -11,16 +11,18 @@ import threading
 import time
 import traceback
 from datetime import date
-from typing import Any, Callable, Iterable, Optional, Tuple
+from typing import IO, Any, Callable, Iterable, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
 from constants import (
-    DATA_CACHE_TTL, DATA_FIRST_LOAD_RETRY_INTERVAL, DATA_RETRY_INTERVAL, DAY_LABELS,
-    LOCAL_TIMEZONE, MAX_UNPARSEABLE_DATE_SHARE, MIN_LAST_DAY_SHARE, MIN_PROJECTION_DAYS,
-    MIN_REFRESH_ROW_SHARE, NUMBER_COLUMNS, REQUIRED_COLUMNS, TEXT_COLUMNS,
+    DATA_CACHE_TTL, DATA_FIRST_LOAD_RETRY_INTERVAL, DATA_MAX_RETRY_INTERVAL, DATA_RETRY_INTERVAL, DAY_LABELS,
+    HOLIDAY_SHORT_NAMES, LOCAL_TIMEZONE, MAX_HOLIDAY_LABEL_LENGTH, MAX_UNPARSEABLE_DATE_SHARE,
+    MIN_LAST_DAY_SHARE, MIN_PROJECTION_DAYS, MIN_REFRESH_ROW_SHARE, NUMBER_COLUMNS,
+    REQUIRED_COLUMNS, TEXT_COLUMNS,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,13 +30,18 @@ logger = logging.getLogger(__name__)
 
 def validate_data(df: Optional[pd.DataFrame]) -> bool:
     """Validate that the dataframe has required columns and basic data quality"""
-    if df is None or df.empty:
+    if df is None:
         raise ValueError("DataFrame is empty or None")
 
-    # Check for required columns
+    # Check for required columns. This comes before the check for an empty
+    # frame: one loaded with none of its columns is empty as well, and the
+    # columns it lacks are what there is to say about it.
     missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
     if missing_cols:
         raise ValueError(f"Missing required columns: {missing_cols}")
+
+    if df.empty:
+        raise ValueError("DataFrame is empty or None")
 
     # Check for basic data quality
     if df['latitude'].isna().all() or df['longitude'].isna().all():
@@ -95,6 +102,24 @@ def day_labels(days: Iterable[Any]) -> list[str]:
     return [DAY_LABELS[int(day) - 1] if day in range(1, 8) else str(day) for day in days]
 
 
+def holiday_label(name: str) -> str:
+    """A holiday's name, short enough to sit beside its mark on the forecast.
+
+    The long official names have a short one of their own. Any other name
+    that is too long is cut at a word, so what is left can still be read.
+    """
+    short = HOLIDAY_SHORT_NAMES.get(name, name)
+    if len(short) <= MAX_HOLIDAY_LABEL_LENGTH:
+        return short
+    kept = ""
+    for word in short.split():
+        longer = f"{kept} {word}".strip()
+        if len(longer) >= MAX_HOLIDAY_LABEL_LENGTH:
+            break
+        kept = longer
+    return (kept or short[:MAX_HOLIDAY_LABEL_LENGTH - 1]) + "…"
+
+
 def format_categorical_series(series: pd.Series, prefix: str = "") -> pd.Series:
     """
     Format a column of numeric codes (precinct, district, zip) as labels.
@@ -132,7 +157,11 @@ TRANSIENT_ERRORS = (
 
 
 class DataNotReadyError(Exception):
-    """The portal answered, but not with the CSV (e.g. while it rebuilds the export)."""
+    """The portal answered, but not with the data (e.g. while it rebuilds the export).
+
+    That is a status document in place of the CSV, or a CSV that is empty or
+    has only its header: the portal empties the dataset while it reloads it.
+    """
 
 
 def is_transient_error(error: Exception) -> bool:
@@ -154,6 +183,13 @@ def _require_csv(start: bytes, content_type: str) -> None:
         raise DataNotReadyError(
             f"the portal sent {content_type or 'an unlabelled response'} instead of the CSV"
         )
+
+
+def _has_rows(csv_file: IO[bytes]) -> bool:
+    """Whether a CSV file holds anything after its first line, the header."""
+    csv_file.seek(0)
+    csv_file.readline()
+    return any(line.strip() for line in csv_file)
 
 
 def safe_load_data_from_url(url: str, timeout: int = 300, max_retries: int = 5,
@@ -184,7 +220,8 @@ def safe_load_data_from_url(url: str, timeout: int = 300, max_retries: int = 5,
         DataFrame
 
     Raises:
-        DataNotReadyError: the portal answered without the CSV
+        DataNotReadyError: the portal answered without the CSV, or with one
+            that is empty or has no rows
         requests.exceptions.RequestException: the download failed
         ValueError: the file could not be parsed
     """
@@ -216,11 +253,21 @@ def safe_load_data_from_url(url: str, timeout: int = 300, max_retries: int = 5,
                         buffer.write(chunk)
 
                 buffer.seek(0)
-                # A stray byte that is not UTF-8 costs one character, not the dataset
-                return pd.read_csv(
-                    buffer, encoding="utf-8-sig", encoding_errors="replace",
-                    usecols=column_filter, low_memory=False,
-                )
+                try:
+                    # A stray byte that is not UTF-8 costs one character, not the dataset
+                    df = pd.read_csv(
+                        buffer, encoding="utf-8-sig", encoding_errors="replace",
+                        usecols=column_filter, low_memory=False,
+                    )
+                except pd.errors.EmptyDataError:
+                    raise DataNotReadyError("the portal sent an empty file instead of the CSV") from None
+                # A file with no rows is an export caught while the portal reloads
+                # its data, not a feed that has changed: worth another attempt. No
+                # rows here can also mean none of the wanted columns (which is
+                # for validation to report), so the file itself is asked.
+                if len(df) == 0 and not _has_rows(buffer):
+                    raise DataNotReadyError("the portal sent a file with no rows in it")
+                return df
 
         except Exception as e:
             if attempt >= max_retries or not is_transient_error(e):
@@ -275,6 +322,11 @@ class RefreshingCache:
     callers get the old value together with the error, and the load is not
     tried again until `retry_interval` has passed.
 
+    A failure that would only repeat (see `can_pass`) is left alone for longer
+    each time: the wait doubles with every such failure in a row, up to
+    `max_retry_interval`. Each try can cost a whole download, and waiting a
+    quarter of an hour does not bring back a column the feed has lost.
+
     Loads run one at a time on a thread of the cache's own. So a load always
     runs to the end and is kept, even when the caller that started it is
     interrupted (Streamlit stops a session's script as soon as its user clicks
@@ -294,17 +346,30 @@ class RefreshingCache:
             when a refresh has loaded. If it raises, the new value is refused
             and the refresh counts as failed. A first load has nothing to be
             compared with, so it is not checked.
+        can_pass: Says whether a failure is one that can pass by itself, such
+            as a fault on the network. One that cannot would only repeat, and
+            is tried again less and less often (see above). Without it every
+            failure is taken for one that can pass.
+        max_retry_interval: The longest a failure that would only repeat is
+            left alone. Defaults to `ttl`. What looks set to repeat can still
+            pass (a short export while the portal reloads its data looks like
+            a feed that has shrunk), and this is how long the cache can then
+            take to find out.
     """
 
     def __init__(self, ttl: float, retry_interval: float,
                  first_retry_interval: Optional[float] = None,
                  clock: Callable[[], float] = time.monotonic,
-                 check: Optional[Callable[[Any, Any], None]] = None) -> None:
+                 check: Optional[Callable[[Any, Any], None]] = None,
+                 can_pass: Optional[Callable[[BaseException], bool]] = None,
+                 max_retry_interval: Optional[float] = None) -> None:
         self._ttl = ttl
         self._retry_interval = retry_interval
         self._first_retry_interval = retry_interval if first_retry_interval is None else first_retry_interval
+        self._max_retry_interval = ttl if max_retry_interval is None else max_retry_interval
         self._clock = clock
         self._check = check
+        self._can_pass = can_pass
         # Guards the fields below. It is never held while a load runs.
         self._lock = threading.Lock()
         self._has_value = False
@@ -312,6 +377,8 @@ class RefreshingCache:
         self._loaded_at = 0.0
         self._failed_at: Optional[float] = None
         self._error: Optional[BaseException] = None
+        self._retry_wait = 0.0  # how long the last failure is left alone
+        self._repeating = False  # whether that failure was one that would only repeat
         self._load: Optional[_Load] = None  # the load under way, if any
 
     def get(self, loader: Callable[[], Any]) -> Tuple[Any, Optional[BaseException]]:
@@ -337,8 +404,7 @@ class RefreshingCache:
 
             load = self._load
             if load is None:
-                retry_interval = self._retry_interval if self._has_value else self._first_retry_interval
-                if self._failed_at is not None and self._clock() - self._failed_at < retry_interval:
+                if self._failed_at is not None and self._clock() - self._failed_at < self._retry_wait:
                     if self._has_value:
                         return self._value, self._error
                     raise LoadFailedError(str(self._error)) from self._error
@@ -386,10 +452,25 @@ class RefreshingCache:
                     if load.error is None:
                         self._value, self._has_value = load.value, True
                         self._loaded_at, self._failed_at, self._error = now, None, None
+                        self._repeating = False
                     else:
                         self._failed_at, self._error = now, load.error
+                        self._retry_wait = self._wait_after(load.error)
             finally:
                 load.done.set()
+
+    def _wait_after(self, error: BaseException) -> float:
+        """How long the loader is left alone after failing with `error`.
+
+        The usual interval, or twice the last wait (up to `max_retry_interval`)
+        when this failure and the one before it would both only repeat. Called
+        with the lock held.
+        """
+        usual = self._retry_interval if self._has_value else self._first_retry_interval
+        would_repeat = self._can_pass is not None and not self._can_pass(error)
+        again = would_repeat and self._repeating
+        self._repeating = would_repeat
+        return min(self._retry_wait * 2, max(self._max_retry_interval, usual)) if again else usual
 
     def _checked(self, value: Any) -> Any:
         """Return a newly loaded value once `check` has passed it.
@@ -414,6 +495,17 @@ class RefreshingCache:
         with self._lock:
             load = self._load
         return load is None or load.done.wait(timeout)
+
+    def up_to_date(self, value: Any, error: Optional[BaseException]) -> bool:
+        """Whether `value` and `error`, as `get` returned them, are still what there is.
+
+        False while a load is under way, and also when one has ended since
+        that `get`. Asking only whether a load is running would miss a refresh
+        that ended in between, and leave the caller with the old value and no
+        reason to come back for the new one.
+        """
+        with self._lock:
+            return self._load is None and self._value is value and self._error is error
 
     def expire(self) -> None:
         """Make the next `get` load again, whatever the age of the value or of a failure.
@@ -458,6 +550,8 @@ def dataset_cache() -> RefreshingCache:
         retry_interval=DATA_RETRY_INTERVAL,
         first_retry_interval=DATA_FIRST_LOAD_RETRY_INTERVAL,
         check=refuse_shrunken_refresh,
+        can_pass=is_transient_error,
+        max_retry_interval=DATA_MAX_RETRY_INTERVAL,
     )
 
 
@@ -692,6 +786,21 @@ def same_day_last_year(day: date) -> date:
 # A change that rounds to nothing. It carries no sign, so that it is not drawn
 # as a rise or a fall (see `format_change`).
 NO_CHANGE = "0.0%"
+
+
+def format_daily_rate(per_day: float) -> str:
+    """Incidents per day for the KPI card.
+
+    One decimal place, or two significant digits below one a day, so a rare
+    category shows as 0.0043 rather than 0.0. A rate that rounds up to one a
+    day is shown as 1.0, like any other at or above one, and a very small one
+    is written out in full rather than as 9e-05.
+    """
+    if per_day < 1:
+        text = np.format_float_positional(per_day, precision=2, unique=False, fractional=False, trim="-")
+        if float(text) < 1:
+            return text
+    return f"{per_day:.1f}"
 
 
 def format_change(fraction: float) -> str:

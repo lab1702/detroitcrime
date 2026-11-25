@@ -458,6 +458,9 @@ class WaitingCache:
     def wait(self, timeout=None) -> bool:
         return not (self.still_running.pop(0) if self.still_running else False)
 
+    def up_to_date(self, value, error) -> bool:
+        return self.wait()
+
 
 def test_page_is_drawn_again_when_the_refresh_it_waits_for_has_ended(clean_df, monkeypatch):
     # Running when the page starts, over by the time the page asks again. An
@@ -483,6 +486,25 @@ def test_page_waiting_for_a_refresh_is_not_drawn_again_before_it_ends(clean_df, 
     assert not at.exception, at.exception
     assert cache.gets == 1
     assert [c.value for c in at.caption] == [REFRESHING_NOTE]
+    assert at.metric
+
+
+def test_refresh_that_ends_as_the_page_starts_is_not_missed(clean_df, monkeypatch):
+    # The refresh ended between the page being handed the old copy and its
+    # asking about it: nothing is running any more, but what the page holds is
+    # no longer what there is. It used to stay on the old figures.
+    class JustEnded(WaitingCache):
+        def up_to_date(self, value, error) -> bool:
+            return self.gets > 1
+
+    cache = JustEnded(clean_df, still_running=[])
+    monkeypatch.setattr(utils, "dataset_cache", lambda: cache)
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=TIMEOUT)
+    at.run()
+
+    assert not at.exception, at.exception
+    assert cache.gets == 2
+    assert not at.caption
     assert at.metric
 
 
@@ -621,6 +643,43 @@ def test_heatmap_counts_the_rest_when_a_day_cell_is_not_a_number(raw_feed):
     heatmap = next(f for f in plotly_figures(at) if f["data"][0]["type"] == "heatmap")["data"][0]
     assert values(heatmap["y"]) == [1, 2, 3, 4, 5, 6, 7]
     assert sum(values(heatmap["z"])) == len(df) - 1
+    # The page says that one incident is not in the chart
+    assert f"1 of {len(df):,} incidents have no usable day or hour and are not in the chart." in [
+        c.value for c in at.caption
+    ]
+
+
+def test_heatmap_says_how_many_incidents_it_has_no_cell_for(raw_feed):
+    # Day 0 and hour 24 are numbers, but not a day of the week or an hour of the day
+    feed = raw_feed.copy()
+    feed.loc[feed.index[:50], "incident_day_of_week"] = 0
+    feed.loc[feed.index[50:90], "incident_hour_of_day"] = 24
+    df = clean_feed(feed)
+    odd = int(((df["incident_day_of_week"] == 0) | (df["incident_hour_of_day"] == 24)).sum())
+    assert odd > 0
+
+    at = run_page("2_Trends.py", make_page_state(df))
+    heatmap = next(f for f in plotly_figures(at) if f["data"][0]["type"] == "heatmap")["data"][0]
+    assert sum(values(heatmap["z"])) == len(df) - odd
+    assert f"{odd} of {len(df):,} incidents have no usable day or hour and are not in the chart." in [
+        c.value for c in at.caption
+    ]
+
+
+def test_heatmap_with_every_incident_in_it_has_no_note(page_state):
+    at = run_page("2_Trends.py", page_state)
+    assert not any("day or hour" in c.value for c in at.caption)
+
+
+def test_forecast_names_each_holiday_once_and_in_full(page_state):
+    at = run_page("2_Trends.py", page_state)
+    names = [note["text"] for note in forecast_figure(at)["layout"]["annotations"]]
+    # The year after 30 March 2026. 4 July 2026 is a Saturday: the Friday it is
+    # observed on carries no second "Independence Day" next to the first.
+    assert names == [
+        "Memorial Day", "Juneteenth", "Independence Day", "Labor Day", "Columbus Day", "Veterans Day",
+        "Thanksgiving Day", "Christmas Day", "New Year's Day", "MLK Day", "Presidents' Day",
+    ]
 
 
 def test_forecast_ignores_the_year_filter(clean_df):

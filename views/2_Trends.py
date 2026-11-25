@@ -12,7 +12,7 @@ from constants import (
     CHART_HEIGHT, MIN_FORECAST_DAYS, FORECAST_PERIODS, HISTORICAL_MONTHS,
     FORECAST_CACHE_TTL, YOY_CACHE_TTL, DAY_LABELS, COLOR_SCALE_HEATMAP,
 )
-from utils import daily_incident_counts, part_year_note, partial_years, project_full_year
+from utils import daily_incident_counts, holiday_label, part_year_note, partial_years, project_full_year
 from theme import inject_css, apply_dark_plotly, BLUE_ACCENT
 
 # How solid the bar of a year the data covers only in part is drawn (1 is a whole year)
@@ -120,6 +120,11 @@ with right:
 
     @st.cache_data(ttl=FORECAST_CACHE_TTL)
     def create_heatmap(df):
+        """The chart, and how many incidents it has no cell for.
+
+        Those are the ones whose day or hour is missing, or is not a day of
+        the week or an hour of the day.
+        """
         heatmap_data = (
             df.groupby(["incident_day_of_week", "incident_hour_of_day"])
             .size()
@@ -131,6 +136,7 @@ with right:
         # Always the full week by 24 hours, so a small selection is not drawn
         # as a few stretched cells
         pivot = pivot.reindex(index=range(1, 8), columns=range(24)).fillna(0)
+        left_out = len(df) - int(pivot.to_numpy().sum())
 
         fig = px.imshow(
             pivot,
@@ -141,11 +147,17 @@ with right:
         # incident_day_of_week is ISO-numbered: 1=Monday ... 7=Sunday
         fig.update_yaxes(tickvals=list(range(1, 8)), ticktext=DAY_LABELS)
         fig.update_layout(height=CHART_HEIGHT)
-        return fig
+        return fig, left_out
 
-    fig_hm = create_heatmap(df_filtered)
+    fig_hm, left_out = create_heatmap(df_filtered)
     apply_dark_plotly(fig_hm, BLUE_ACCENT)
     st.plotly_chart(fig_hm, width="stretch")
+    # The cells would otherwise add up to less than the other charts, unexplained
+    if left_out:
+        st.caption(
+            f"{left_out:,} of {len(df_filtered):,} incidents have no usable day or hour "
+            "and are not in the chart."
+        )
 
 
 # ── Forecast (full width) ────────────────────────────────────────────────────
@@ -237,9 +249,12 @@ def create_forecast(df: pd.DataFrame, start, end) -> Optional[go.Figure]:
         )
     )
 
-    # Holiday annotations
+    # Holiday annotations. Each holiday is marked once, on the day itself: the
+    # day it is observed on, when that is another one, is next to it and would
+    # put a second mark and name over the first. (The model is fitted on both.)
     forecast_holidays = holidays[
         (holidays["ds"] >= forecast_start) & (holidays["ds"] <= future_dates["ds"].max())
+        & ~holidays["holiday"].str.endswith("(observed)")
     ]
     if not forecast_holidays.empty:
         y_max = future_dates["yhat"].max()
@@ -256,12 +271,10 @@ def create_forecast(df: pd.DataFrame, start, end) -> Optional[go.Figure]:
             )
             level = i % 4
             y_pos = y_max - (y_range * 0.1) - level * (y_range * 0.25)
-            name = holiday["holiday"]
-            display = name if len(name) <= 12 else name[:9] + "..."
             fig.add_annotation(
                 x=holiday["ds"],
                 y=y_pos,
-                text=display,
+                text=holiday_label(holiday["holiday"]),
                 showarrow=True,
                 arrowhead=1,
                 arrowsize=0.7,

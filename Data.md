@@ -71,6 +71,7 @@ The application implements several data quality measures:
 - **Text Cleanup**: Trailing padding is trimmed from category, description, status, neighborhood and intersection values; a value that is only padding is treated as missing
 - **Day and Hour Numbers**: `incident_day_of_week` and `incident_hour_of_day` are read as whole numbers; a value that is not one (text, a fraction) is treated as missing
 - **Quality Control**: Removes records with missing, non-numeric or out-of-range coordinates, from every figure and not only from the map; a feed left with no rows is treated as a failed load
+- **Empty Export**: The portal empties the dataset while it reloads it, and an export made then is empty or has only its header. That is taken for a portal that is not ready, and the download is tried again. A file that has rows but lacks the columns the app reads is a feed that has changed: it is reported by the columns it lacks, and tried again less and less often
 - **Shrunken Refresh**: A refresh left with fewer than 90% of the incidents of the copy in use is refused as incomplete (a short export, or coordinates gone missing), and the copy in use is kept. A first load has nothing to be compared with and is taken as it comes
 - **Real-time Exclusion**: Excludes the feed's last day, and anything dated after it, to avoid incomplete data. The last day is the latest one with at least 10% of a typical (median) day's incidents, so a lone row with a mistyped later date is not taken for it
 - **Categorical Formatting**: Zip codes, precincts and districts are read as numeric codes; rows without a valid code (a whole number above zero, written as a plain number) are left out of charts that group by them (the pivot says how many)
@@ -81,6 +82,6 @@ The application implements several data quality measures:
 - The feed holds incidents reported from December 2016 to the present; an incident can have occurred before it was reported, and the app keeps those from 2018-01-01 onwards
 - Real-time data with recent incidents marked as "ACTIVE"
 - Each row is one offense: a report with several charges appears once per charge, so counts are offenses, not distinct reports
-- The portal export typically lags the present by several days; year-to-date figures are measured up to the last day in the data
+- The portal export typically lags the present by several days; year-to-date figures are measured up to the last day in the data. As seen on 25 November 2026: the export held incidents up to the 23rd, with about half of a usual day's on that last day (the one the app leaves out) and the days before it at about their usual level. The two weeks before it ran under a tenth below what the same weeks of earlier years would suggest, which is the most that late reports may still add to them
 - Application validates data structure on load
 - Comprehensive error handling for data quality issues
