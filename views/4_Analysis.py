@@ -28,11 +28,13 @@ inject_css()
 
 st.header("Pivot Analysis")
 
-if "df_filtered" not in st.session_state:
+# The data app.py lends each run (see app.main)
+run_data = st.session_state.get("run_data", {})
+if "df_filtered" not in run_data:
     st.warning("Loading data — please wait…")
     st.stop()
 
-df_filtered: pd.DataFrame = st.session_state["df_filtered"]
+df_filtered: pd.DataFrame = run_data["df_filtered"]
 
 if df_filtered.empty:
     st.warning("No data available for selected filters.")

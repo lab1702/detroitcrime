@@ -8,18 +8,20 @@ import pandas as pd
 import pydeck as pdk
 from pydeck.bindings.json_tools import default_serialize
 
-from constants import MAX_SCATTER_POINTS
+from constants import MAX_HEATMAP_CELLS, MAX_SCATTER_POINTS
 from theme import inject_css
 
 inject_css()
 
 st.header("Map")
 
-if "df_filtered" not in st.session_state:
+# The data app.py lends each run (see app.main)
+run_data = st.session_state.get("run_data", {})
+if "df_filtered" not in run_data:
     st.warning("Loading data — please wait…")
     st.stop()
 
-df_filtered: pd.DataFrame = st.session_state["df_filtered"]
+df_filtered: pd.DataFrame = run_data["df_filtered"]
 
 if df_filtered.empty:
     st.warning("No data available for selected filters.")
@@ -147,15 +149,21 @@ if mode == "Scatter":
 
 else:
     # Incidents at the same spot are sent once with a weight, which gives the
-    # same density as one row per incident with a far smaller payload.
-    df_heat = (
-        pd.DataFrame({
-            "lat": df_map["latitude"].round(4),
-            "lon": df_map["longitude"].round(4),
-        })
-        .value_counts()
-        .reset_index(name="weight")
-    )
+    # same density as one row per incident with a far smaller payload. A spot
+    # is a position rounded to 4 decimal places (about 10 m). Should that leave
+    # more spots than MAX_HEATMAP_CELLS it is rounded to 3 places, then 2:
+    # within the area the data is kept to, 2 places cannot give that many.
+    for decimals in (4, 3, 2):
+        df_heat = (
+            pd.DataFrame({
+                "lat": df_map["latitude"].round(decimals),
+                "lon": df_map["longitude"].round(decimals),
+            })
+            .value_counts()
+            .reset_index(name="weight")
+        )
+        if len(df_heat) <= MAX_HEATMAP_CELLS:
+            break
 
     layer = pdk.Layer(
         "HeatmapLayer",

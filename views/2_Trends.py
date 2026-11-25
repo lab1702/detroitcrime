@@ -19,11 +19,13 @@ inject_css()
 
 st.header("Trends")
 
-if "df_filtered" not in st.session_state:
+# The data app.py lends each run (see app.main)
+run_data = st.session_state.get("run_data", {})
+if "df_filtered" not in run_data:
     st.warning("Loading data — please wait…")
     st.stop()
 
-df_filtered: pd.DataFrame = st.session_state["df_filtered"]
+df_filtered: pd.DataFrame = run_data["df_filtered"]
 
 if df_filtered.empty:
     st.warning("No data available for selected filters.")
@@ -38,7 +40,7 @@ period_start = st.session_state["period_start"]
 period_end = st.session_state["period_end"]
 selected_year = st.session_state.get("selected_year", "All")
 # The category selection across every year, which the forecast is fitted on
-df_all_years: pd.DataFrame = st.session_state["df_all_years"]
+df_all_years: pd.DataFrame = run_data["df_all_years"]
 
 
 # ── Daily Incidents (full width) ─────────────────────────────────────────────
@@ -136,14 +138,17 @@ def create_forecast(df: pd.DataFrame, start, end) -> Optional[go.Figure]:
     dataset covers), counting days without incidents as zero, and forecasts
     the year after `end`.
 
-    Returns None when there is too little history to forecast. Errors are
-    raised, not swallowed, so a failed fit is never cached as a result.
+    Returns None when there is too little history to forecast: fewer than
+    MIN_FORECAST_DAYS days with an incident. Errors are raised, not
+    swallowed, so a failed fit is never cached as a result.
     """
     daily_counts = daily_incident_counts(df, start, end).rename(
         columns={"date": "ds", "count": "y"}
     )
 
-    if len(daily_counts) < MIN_FORECAST_DAYS:
+    # Days that had incidents, not rows: there is a row for every day the
+    # dataset covers, however few of them the selection has anything on
+    if (daily_counts["y"] > 0).sum() < MIN_FORECAST_DAYS:
         return None
 
     holidays = make_holidays_df(
@@ -268,7 +273,10 @@ except Exception as e:
     st.error(f"Error creating forecast: {str(e)}")
 else:
     if forecast_fig is None:
-        st.info(f"Not enough data for forecasting (minimum {MIN_FORECAST_DAYS} days required).")
+        st.info(
+            f"Not enough data for forecasting: this selection needs incidents on at least "
+            f"{MIN_FORECAST_DAYS} days."
+        )
     else:
         apply_dark_plotly(forecast_fig, BLUE_ACCENT)
         st.plotly_chart(forecast_fig, width="stretch")

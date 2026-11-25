@@ -1,6 +1,7 @@
 """Data loading, cleaning and year-over-year maths."""
 
 import gc
+import logging
 import threading
 import weakref
 from datetime import date
@@ -110,6 +111,19 @@ class TestBadDates:
         df = clean(feed_rows(stamps))
         assert df["date"].tolist() == [date(2024, 3, 1), date(2024, 3, 2), date(2024, 3, 3), date(2024, 3, 4)]
 
+    def test_timestamp_with_nanoseconds_does_not_fail_the_load(self):
+        # Read on its own it comes back in a finer unit than the column holds
+        good = [f"2024/03/{day:02d} 15:00:00+00" for day in range(1, 29)] * 8
+        df = clean(feed_rows(good + ["2024-03-03T15:00:00.1234567Z", LATER]))
+        assert len(df) == len(good) + 1
+        assert (df["date"] == date(2024, 3, 3)).sum() == 9
+
+    def test_padding_only_timestamp_is_missing_not_unreadable(self):
+        # As unreadable ones, 2 in 52 would be over the limit and refuse the load
+        good = [f"2024/03/{day:02d} 15:00:00+00" for day in range(1, 26)] * 2
+        df = clean(feed_rows(good + ["      ", "", LATER]))
+        assert len(df) == len(good)
+
     def test_a_feed_of_unreadable_timestamps_is_refused(self):
         with pytest.raises(ValueError, match="2 of 4 timestamps could not be read"):
             clean(feed_rows(["2024/03/01 15:00:00+00", "soon", "later", LATER]))
@@ -158,6 +172,20 @@ class TestDayAndHourNumbers:
         assert df["incident_day_of_week"].dropna().tolist() == [5, 5]
         assert df["incident_hour_of_day"].isna().tolist() == [False, False, True]
         assert df["incident_hour_of_day"].dropna().tolist() == [10, 11]
+
+    def test_one_empty_cell_does_not_turn_the_rest_into_floats(self):
+        # With an empty cell read_csv hands the column over as floats: 5.0, 10.0
+        df = clean(feed_rows(
+            ["2024/03/01 15:00:00+00", "2024/03/01 16:00:00+00", "2024/03/01 17:00:00+00", LATER],
+            incident_day_of_week=[5.0, None, 5.0, 2.0],
+            incident_hour_of_day=[10.0, 11.0, 3.5, 7.0],
+        ))
+        assert pd.api.types.is_integer_dtype(df["incident_day_of_week"])
+        assert pd.api.types.is_integer_dtype(df["incident_hour_of_day"])
+        assert [str(day) for day in df["incident_day_of_week"].dropna()] == ["5", "5"]
+        # Half past three is not an hour of the day
+        assert df["incident_hour_of_day"].isna().tolist() == [False, False, True]
+        assert [str(hour) for hour in df["incident_hour_of_day"].dropna()] == ["10", "11"]
 
     def test_numbers_are_left_as_they_are(self, raw_feed, clean_df):
         assert pd.api.types.is_integer_dtype(clean_df["incident_day_of_week"])
@@ -289,6 +317,14 @@ class TestCategoricalFormatting:
         codes = pd.Series(["inf", "1e400", 3.7, "4.0", 1e300])
         assert numeric_codes(codes).tolist() == [0, 0, 0, 4, 0]
         assert numeric_codes(pd.Series([2, 12])).tolist() == [2, 12]
+
+    def test_codes_are_above_zero_and_written_as_plain_numbers(self):
+        assert numeric_codes(pd.Series([-3, 5, 0])).tolist() == [0, 5, 0]
+        assert format_categorical_series(pd.Series([-3, 5]), "Precinct").tolist() == ["Precinct 5"]
+        # A parser takes these for 1000, 16 and 1; nobody writes a precinct that way
+        odd = pd.Series(["1e3", "0x10", "True", " 7 ", "-2", True])
+        assert numeric_codes(odd).tolist() == [0, 0, 0, 7, 0, 0]
+        assert numeric_codes(pd.Series([True, False])).tolist() == [0, 0]
 
     def test_labels_keep_the_order_of_the_codes(self):
         assert code_labels([2, 9, 10], "Precinct") == ["Precinct 2", "Precinct 9", "Precinct 10"]
@@ -664,6 +700,20 @@ class TestRefreshingCache:
         gc.collect()
         assert (value, str(error)) == ("first", "the feed changed")
         assert downloads[0]() is None
+
+    def test_failed_load_is_logged_with_where_it_went_wrong(self, cache, caplog):
+        # The pages show the message only, and the traceback is not kept
+        def failing_load():
+            raise ValueError("the feed changed")
+
+        with caplog.at_level(logging.ERROR, logger="utils"):
+            with pytest.raises(LoadFailedError):
+                cache.get(failing_load)
+
+        [record] = [r for r in caplog.records if r.name == "utils"]
+        assert record.levelname == "ERROR"
+        assert "ValueError: the feed changed" in caplog.text
+        assert "in failing_load" in caplog.text
 
     def test_expire_makes_the_next_get_refresh(self, cache):
         load = loader("first", "second")

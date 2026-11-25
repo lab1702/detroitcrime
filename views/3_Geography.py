@@ -12,11 +12,13 @@ inject_css()
 
 st.header("Geography")
 
-if "df_filtered" not in st.session_state:
+# The data app.py lends each run (see app.main)
+run_data = st.session_state.get("run_data", {})
+if "df_filtered" not in run_data:
     st.warning("Loading data — please wait…")
     st.stop()
 
-df_filtered: pd.DataFrame = st.session_state["df_filtered"]
+df_filtered: pd.DataFrame = run_data["df_filtered"]
 
 if df_filtered.empty:
     st.warning("No data available for selected filters.")
@@ -53,20 +55,20 @@ with left:
     bar_chart(counts, "Neighborhood", RED_ACCENT)
 
 with right:
-    st.subheader(f"Top {TOP_N_ITEMS} Police Precincts")
+    # Every precinct, not a top 10: there are 11, so one would always be left out
+    st.subheader("Police Precincts")
     precincts = format_categorical_series(df_filtered["police_precinct"], "Precinct")
-    counts = precincts.value_counts().head(TOP_N_ITEMS)
-    bar_chart(counts, "Precinct", AMBER_ACCENT)
+    bar_chart(precincts.value_counts(), "Precinct", AMBER_ACCENT)
 
 
 # ── Row 2: Districts + Zip Codes ─────────────────────────────────────────────
 left2, right2 = st.columns(2)
 
 with left2:
-    st.subheader(f"Top {TOP_N_ITEMS} Council Districts")
+    # Every district as well: there are 7
+    st.subheader("Council Districts")
     districts = format_categorical_series(df_filtered["council_district"], "District")
-    counts = districts.value_counts().head(TOP_N_ITEMS)
-    bar_chart(counts, "District", RED_ACCENT)
+    bar_chart(districts.value_counts(), "District", RED_ACCENT)
 
 with right2:
     st.subheader(f"Top {TOP_N_ITEMS} Zip Codes")

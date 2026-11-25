@@ -22,8 +22,13 @@ TIMEOUT = 300  # the Trends page fits a Prophet model
 
 def run_page(name: str, state: dict) -> AppTest:
     at = AppTest.from_file(str(ROOT / "views" / name), default_timeout=TIMEOUT)
+    # As app.py hands it over: the DataFrames in the holder it lends each run,
+    # the rest as plain session state
+    run_data = {key: value for key, value in state.items() if isinstance(value, pd.DataFrame)}
+    at.session_state["run_data"] = run_data
     for key, value in state.items():
-        at.session_state[key] = value
+        if key not in run_data:
+            at.session_state[key] = value
     at.run()
     assert not at.exception, at.exception
     return at
@@ -118,14 +123,54 @@ def test_year_filter_only_offers_years_in_the_data(overview, clean_df):
 
     year_select.select(2025).run()
     assert not overview.exception
-    filtered = overview.session_state["df_filtered"]
-    assert set(filtered["incident_year"]) == {2025}
-    # Every incident's local date falls inside the selected year
-    assert filtered["date"].min().year == filtered["date"].max().year == 2025
+    metrics = {m.label: m for m in overview.metric}
+    # Only the incidents whose local date falls inside the selected year are counted
+    in_2025 = clean_df["date"].map(lambda day: day.year == 2025)
+    assert metrics["Total Incidents"].value == f"{in_2025.sum():,}"
 
     # The period is the calendar year, whatever days happen to have incidents
-    date_range = {m.label: m for m in overview.metric}["Date Range"]
+    date_range = metrics["Date Range"]
     assert (date_range.value, date_range.delta) == ("365 days", "2025-01-01 to 2025-12-31")
+
+
+def test_help_explains_the_change_only_where_one_is_shown(overview):
+    explains_change = "The change compares this year"
+    for_every_year = {m.label: m.help for m in overview.metric}
+    assert explains_change in for_every_year["Total Incidents"]
+    assert explains_change in for_every_year["Avg Daily"]
+
+    # A past year has no change from last year, so there is none to explain
+    overview.sidebar.selectbox[1].select(2025).run()
+    past_year = {m.label: m for m in overview.metric}
+    assert not past_year["Total Incidents"].delta
+    assert explains_change not in past_year["Total Incidents"].help
+    assert not past_year["Avg Daily"].help
+    # What the total leaves out is said whatever the year
+    assert "coordinates" in past_year["Total Incidents"].help
+    assert "coordinates" in for_every_year["Total Incidents"]
+
+
+def test_no_dataframe_is_left_in_session_state(raw_feed, monkeypatch):
+    # Session state lasts as long as the browser tab stays open. The data is
+    # lent to the page for one run, not kept there for every idle tab.
+    feed = raw_feed.copy()
+    rare = feed.index[feed["incident_occurred_at"].str.startswith("2025/07/1")][:3]
+    feed.loc[rare, "offense_category"] = "RARE"
+    at = run_app(feed, monkeypatch)
+    assert at.metric  # the page had its data while it ran
+    assert at.session_state["run_data"] == {}
+    assert "df_filtered" not in at.session_state and "df_all_years" not in at.session_state
+
+    # The same after a run the page cut short: this category has nothing in 2026
+    at.sidebar.selectbox[0].select("RARE").run()
+    at.sidebar.selectbox[1].select(2026).run()
+    assert [w.value for w in at.warning] == ["No data available for selected filters."]
+    assert at.session_state["run_data"] == {}
+
+    # And after a run on another page
+    at.switch_page("views/3_Geography.py").run()
+    assert not at.exception
+    assert at.session_state["run_data"] == {}
 
 
 def test_current_year_keeps_its_change_from_last_year(overview):
@@ -273,6 +318,51 @@ def test_refreshed_data_is_shown_on_the_run_after_it_arrives(overview, raw_feed,
     assert {m.label: m.value for m in overview.metric}["Total Incidents"] != before
 
 
+def test_filters_are_kept_when_a_refresh_changes_their_options(overview, raw_feed, monkeypatch):
+    overview.sidebar.selectbox[0].select("CATEGORY 03").run()
+    overview.sidebar.selectbox[1].select(2025).run()
+    before = {m.label: m.value for m in overview.metric}["Total Incidents"]
+
+    # The refreshed feed has lost 2024 (local midnight on 1 Jan 2025 is 05:00 UTC)
+    # and has a category not seen before, on a day in 2026
+    newer = raw_feed[raw_feed["incident_occurred_at"] >= "2025/01/01 05:00:00+00"].copy()
+    in_2026 = newer.index[newer["incident_occurred_at"].str.startswith("2026/02")]
+    newer.loc[in_2026[0], "offense_category"] = "BRAND NEW"
+    monkeypatch.setattr(utils, "safe_load_data_from_url", lambda url, **kwargs: newer.copy())
+    utils.dataset_cache().expire()
+    overview.run()
+    assert utils.dataset_cache().wait(timeout=TIMEOUT)
+    overview.run()
+    assert not overview.exception
+
+    # Both lists of options changed, and both choices are still made
+    category, year = overview.sidebar.selectbox
+    assert "BRAND NEW" in category.options
+    assert year.options == ["All", "2025", "2026"]
+    assert (category.value, year.value) == ("CATEGORY 03", 2025)
+    assert {m.label: m.value for m in overview.metric}["Total Incidents"] == before
+
+
+def test_filter_that_is_no_longer_offered_falls_back_to_all(overview, raw_feed, monkeypatch):
+    overview.sidebar.selectbox[0].select("CATEGORY 03").run()
+    overview.sidebar.selectbox[1].select(2025).run()
+
+    # The category has gone from the refreshed feed
+    without = raw_feed[raw_feed["offense_category"] != "CATEGORY 03"]
+    monkeypatch.setattr(utils, "safe_load_data_from_url", lambda url, **kwargs: without.copy())
+    utils.dataset_cache().expire()
+    overview.run()
+    assert utils.dataset_cache().wait(timeout=TIMEOUT)
+    overview.run()
+    assert not overview.exception
+
+    category, year = overview.sidebar.selectbox
+    assert "CATEGORY 03" not in category.options
+    assert (category.value, year.value) == ("All", 2025)
+    in_2025 = clean_feed(without)["incident_year"] == 2025
+    assert {m.label: m.value for m in overview.metric}["Total Incidents"] == f"{in_2025.sum():,}"
+
+
 def test_feed_with_no_usable_rows_is_an_error_and_is_not_kept(raw_feed, monkeypatch):
     # Every coordinate outside Detroit: the feed passes validation, then loses every row
     monkeypatch.setattr(utils, "safe_load_data_from_url", lambda url, **kwargs: raw_feed.assign(latitude=10.0))
@@ -355,7 +445,7 @@ def test_forecast_ignores_the_year_filter(clean_df):
 
 def test_forecast_for_a_quiet_category_starts_after_the_data_and_stays_above_zero(clean_df):
     # The category's last incident is two months before the data ends
-    quiet = "CATEGORY 20"
+    quiet = "CATEGORY 19"
     late = (clean_df["offense_category"] == quiet) & (clean_df["incident_occurred_at"] >= "2026-02-01")
     df = clean_df[~late]
     at = run_page("2_Trends.py", make_page_state(df, category=quiet))
@@ -365,9 +455,27 @@ def test_forecast_for_a_quiet_category_starts_after_the_data_and_stays_above_zer
     assert df.loc[df["offense_category"] == quiet, "date"].max() < data_end - timedelta(days=50)
     assert trace(figure, "Forecast")["x"][0][:10] == str(data_end + timedelta(days=1))
 
-    # About one incident every three weeks: an unclipped band would dip below zero
+    # About one incident every two weeks: an unclipped band would dip below zero
     for band in figure["data"][1:]:
         assert min(values(band["y"])) >= 0
+
+
+def test_no_forecast_for_a_selection_with_too_little_history(clean_df):
+    # Three incidents in 22 months. There is a day in the series for every day
+    # the data covers, but only three of them say anything about this category.
+    df = clean_df.copy()
+    rare = df.index[df["incident_occurred_at"] >= "2025-07-10"][:3]
+    df.loc[rare, "offense_category"] = "RARE"
+
+    at = run_page("2_Trends.py", make_page_state(df, category="RARE"))
+    assert not at.error
+    assert [i.value for i in at.info] == [
+        "Not enough data for forecasting: this selection needs incidents on at least 30 days."
+    ]
+    # Daily, year over year and the heatmap are drawn; the forecast is not
+    figures = plotly_figures(at)
+    assert len(figures) == 3
+    assert not any(t.get("name") == "Forecast" for f in figures for t in f["data"])
 
 
 def test_trends_projection_starts_from_last_day_of_data(page_state, clean_df):
@@ -486,14 +594,33 @@ def test_pivot_year_axis_ticks_on_whole_years(clean_df):
     assert at.dataframe[0].value.columns.tolist() == [2025]
 
 
+def test_pivot_hours_stay_whole_numbers_when_a_row_has_none(raw_feed):
+    # One empty cell makes read_csv hand over the whole hour column as floats
+    feed = raw_feed.assign(incident_hour_of_day=raw_feed["incident_hour_of_day"].astype(float))
+    feed.loc[feed.index[0], "incident_hour_of_day"] = np.nan
+    df = clean_feed(feed)
+
+    at = run_page("4_Analysis.py", dict(make_page_state(df), pivot_columns_selection="incident_hour_of_day"))
+    assert not at.exception and not at.error
+    # 0 to 23, not 0.0 to 23.0
+    assert [str(hour) for hour in at.dataframe[0].value.columns] == [str(hour) for hour in range(24)]
+    assert [c.value for c in at.caption] == [
+        f"1 of {len(df):,} incidents have no offense_category or incident_hour_of_day and are not in the table."
+    ]
+
+
 # ── Geography ────────────────────────────────────────────────────────────────
 
 def test_geography_charts(page_state):
     at = run_page("3_Geography.py", page_state)
     figures = plotly_figures(at)
     assert len(figures) == 5
+    # Every precinct and district, not a top 10 that would leave one of the 11 precincts out
     precincts = figures[1]["data"][0]["y"]
-    assert all(label.startswith("Precinct ") for label in precincts)
+    assert set(precincts) == {f"Precinct {n}" for n in range(2, 13)}
+    districts = figures[2]["data"][0]["y"]
+    assert set(districts) == {f"District {n}" for n in range(1, 8)}
+    assert [s.value for s in at.subheader][1:3] == ["Police Precincts", "Council Districts"]
     zips = figures[3]["data"][0]["y"]
     assert set(zips) == {"48201", "48226", "48207", "48210"}
 
@@ -574,3 +701,18 @@ def test_map_heatmap_weights_cover_every_incident(page_state, clean_df):
     layer = deck_spec(at)["layers"][0]
     assert layer["@@type"] == "HeatmapLayer"
     assert sum(point["weight"] for point in layer["data"]) == len(clean_df)
+
+
+def test_map_heatmap_is_coarsened_to_stay_within_its_size_limit(page_state, clean_df, monkeypatch):
+    import constants
+
+    heatmap = dict(page_state, map_view_selection="Heatmap")
+    spots = deck_spec(run_page("5_Map.py", heatmap))["layers"][0]["data"]
+    assert len(spots) > 500
+
+    # With more spots than may be sent, positions are rounded more coarsely
+    monkeypatch.setattr(constants, "MAX_HEATMAP_CELLS", 500)
+    coarser = deck_spec(run_page("5_Map.py", heatmap))["layers"][0]["data"]
+    assert len(coarser) <= 500
+    # Every incident still counts towards its spot
+    assert sum(point["weight"] for point in coarser) == len(clean_df)

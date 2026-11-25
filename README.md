@@ -114,6 +114,7 @@ detroitcrime/
 - Keeps the data for 24 hours, then refreshes it in the background: nobody waits for a refresh, the previous copy is shown until the new one has arrived, and the new one appears on the next rerun after that. If a refresh fails, the previous copy stays in use and a warning is shown
 - Downloads on a background thread shared by every session: visitors who arrive during the first download wait for that one, and a click while waiting does not restart it
 - A failed first load is reported to every visitor and tried again after a minute, rather than repeated for each of them
+- A load that fails is written to the server log with its traceback; the pages show only the message
 - Cleans and filters data for quality
 - Removes invalid coordinates and recent incomplete data
 
@@ -122,10 +123,10 @@ detroitcrime/
 The dashboard has five pages, all driven by the sidebar filters:
 
 1. **Overview**: KPI cards with year-over-year change (shown for all years and for the current year; it compares 1 January to the last day of data with the same days of last year), top categories (or offense descriptions when a category is selected), case status, daily incidents. The daily average is measured over the whole selected period, including days without incidents
-2. **Trends**: Daily incidents, year over year with a projection for the latest year, hour of day x day of week heatmap, 1-year Prophet forecast with holiday annotations. The forecast is fitted on every year of the selected category, so the Year filter does not apply to it
-3. **Geography**: Top neighborhoods, police precincts, council districts, zip codes and intersections
+2. **Trends**: Daily incidents, year over year with a projection for the latest year, hour of day x day of week heatmap, 1-year Prophet forecast with holiday annotations. The forecast is fitted on every year of the selected category, so the Year filter does not apply to it; a selection with incidents on fewer than 30 days is not forecast
+3. **Geography**: Top neighborhoods, zip codes and intersections, and every police precinct and council district
 4. **Pivot Analysis**: Interactive pivot table with customizable rows and columns. Incidents with no value for a chosen field cannot be placed in the table; a note under it says how many
-5. **Map**: Incident locations as colour-coded points (sampled above 50,000 points) or as a density heatmap, which always uses every incident. The chosen view is kept while other pages are visited
+5. **Map**: Incident locations as colour-coded points (sampled above 50,000 points) or as a density heatmap, which always uses every incident (grouped into coarser spots if there are more than 100,000 of them to send). The chosen view is kept while other pages are visited
 
 ### Advanced Features
 
@@ -138,7 +139,7 @@ The dashboard has five pages, all driven by the sidebar filters:
 - **Modular Architecture**: Separated constants, utilities, and main application
 
 ### Data Filtering
-- Offense category and year filters in sidebar
+- Offense category and year filters in sidebar; a choice is kept when a refresh changes the list of options, and falls back to "All" only if it is no longer offered
 - Real-time metric updates based on filters
 - Responsive UI with appropriate warnings for empty data
 
@@ -162,14 +163,14 @@ The application uses the following environment variables (set in docker-compose.
 
 The application implements several data quality measures:
 - Removes records with missing or non-numeric coordinates
-- Filters out invalid coordinates (latitude: 42.0-43.0, longitude: -84.0 to -82.0)
+- Filters out invalid coordinates (latitude: 42.0-43.0, longitude: -84.0 to -82.0). Records removed for their coordinates are left out of every figure, not only the map; the Total Incidents help says so
 - Converts feed timestamps from UTC to Detroit local time before deriving dates and years
-- Drops timestamps that cannot be read, and refuses the load if more than 1% of them are unreadable
+- Drops timestamps that cannot be read, and refuses the load if more than 1% of them are unreadable. A blank timestamp is a missing one, not an unreadable one
 - Drops incidents dated after the current day
 - Excludes the feed's last day, and anything dated after it, to avoid incomplete data. The last day is the latest one with at least 10% of a typical day's incidents, so a lone mistyped date is not taken for it
 - Filters data from 2018-01-01 onwards for consistency
 - Trims padded text values so the same value is not counted twice, and treats a value that is only padding as missing
-- Reads the feed's day-of-week and hour-of-day fields as numbers, and treats a value that is not a number as missing
+- Reads the feed's day-of-week and hour-of-day fields as whole numbers, and treats a value that is not one as missing
 - Replaces bytes that are not valid UTF-8 instead of refusing the file
 
 ## Development Notes

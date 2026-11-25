@@ -18,6 +18,7 @@ DETROIT_LON_MIN = -84.0
 DETROIT_LON_MAX = -82.0
 
 # Forecasting parameters
+# Days with at least one incident that a selection needs before it is forecast
 MIN_FORECAST_DAYS = 30
 FORECAST_PERIODS = 365  # 1 year
 # Days of the current year needed before it is projected to a full year or
@@ -32,6 +33,10 @@ TOP_N_ITEMS = 10
 # Every point is sent to the browser on each rerun, at about 110 bytes apiece,
 # so this many is some 5 MB.
 MAX_SCATTER_POINTS = 50_000
+# Heatmap mode sends one record for each distinct position, at about 40 bytes
+# apiece, so this many is some 4 MB. With more than this, positions are rounded
+# more coarsely until they fit; every incident still counts towards its spot.
+MAX_HEATMAP_CELLS = 100_000
 
 # Share of timestamps that may be unreadable before the load is refused. A few
 # bad rows are dropped; more than this means the feed itself has changed.

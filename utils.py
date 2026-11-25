@@ -46,16 +46,40 @@ def validate_data(df: Optional[pd.DataFrame]) -> bool:
     return True
 
 
+def whole_numbers(series: pd.Series) -> pd.Series:
+    """Read a column as whole numbers, with a missing value for anything else.
+
+    Anything else is text, fractions (3.7 is not hour 3), infinities, and
+    cells that were empty to begin with. The result is of the integer type
+    that allows for missing values, so one empty cell does not turn every
+    other number into a float (3.0).
+    """
+    numbers = pd.to_numeric(series, errors='coerce')
+    # Beyond 2**53 a float no longer holds a whole number exactly
+    whole = ((numbers % 1 == 0) & (numbers.abs() < 2**53)).fillna(False).astype(bool)
+    return numbers.where(whole).astype("Int64")
+
+
+# Text written as a plain number: digits, with nothing but zeros after the point
+_PLAIN_NUMBER = r"\s*\d+(?:\.0*)?\s*"
+
+
 def numeric_codes(series: pd.Series) -> pd.Series:
     """Parse a column of numeric codes to ints, with 0 for anything invalid.
 
-    Invalid is anything that is not a whole number: text, missing values,
-    fractions (3.7 is not precinct 3) and infinities.
+    Invalid is anything that is not a whole number above zero: text, missing
+    values, fractions (3.7 is not precinct 3), infinities and negative
+    numbers. So is a value that a parser takes for a number but that is not
+    written as one, such as "1e3" or True.
     """
-    codes = pd.to_numeric(series, errors='coerce')
-    # Beyond 2**53 a float no longer holds a whole number exactly
-    whole = ((codes % 1 == 0) & (codes.abs() < 2**53)).fillna(False)
-    return codes.where(whole, 0).astype(int)
+    if pd.api.types.is_bool_dtype(series.dtype):
+        return pd.Series(0, index=series.index, dtype=int)
+    codes = whole_numbers(series)
+    valid = (codes > 0).fillna(False).astype(bool)
+    if not pd.api.types.is_numeric_dtype(series.dtype):
+        # Text, or text and numbers mixed
+        valid &= series.astype(str).str.fullmatch(_PLAIN_NUMBER, na=False).astype(bool)
+    return codes.where(valid, 0).astype(int)
 
 
 def code_labels(codes: Iterable[int], prefix: str = "") -> list[str]:
@@ -337,6 +361,9 @@ class RefreshingCache:
                 load.value = loader()
             except BaseException as error:  # whatever stops the load is its outcome
                 load.error = error
+                # The pages only show the message. This is the one record of
+                # where it went wrong: the frames are let go of straight after.
+                logger.exception("Loading failed")
                 _release_frames(error)
         finally:
             # Whatever went wrong above, nobody is left waiting for this load
@@ -400,15 +427,24 @@ def parse_feed_timestamps(raw: pd.Series) -> pd.Series:
     of them cannot be read the feed itself has changed, and dropping that many
     incidents would understate every count, so that raises instead.
 
+    A cell of nothing but padding has no date: it is missing, not unreadable,
+    as it is in the text columns.
+
     Raises:
         ValueError: too many timestamps could not be read
     """
+    if pd.api.types.is_string_dtype(raw):
+        raw = raw.mask(raw.str.strip() == "")
+
     try:
         occurred = pd.to_datetime(raw, utc=True, errors='coerce')
         unread = occurred.isna() & raw.notna()
         if unread.any():
-            # Not written like the rest of the column: read those one by one
-            occurred[unread] = pd.to_datetime(raw[unread], utc=True, errors='coerce', format='mixed')
+            # Not written like the rest of the column: read those one by one.
+            # They can come back in a finer unit than the column holds (a value
+            # with nanoseconds does), which the column would refuse.
+            reread = pd.to_datetime(raw[unread], utc=True, errors='coerce', format='mixed')
+            occurred[unread] = reread.dt.as_unit(occurred.dt.unit)
             unread = occurred.isna() & raw.notna()
     except (ValueError, TypeError) as e:
         raise ValueError(f"Failed to parse incident dates: {str(e)}")
@@ -457,10 +493,10 @@ def clean_and_filter_data(df: pd.DataFrame, min_date: str,
 
     # The same goes for the feed's day and hour numbers. Left as text they
     # match none of the days and hours the charts lay out, and the heatmap
-    # comes out empty; a cell that is not a number is missing instead.
+    # comes out empty; a cell that is not a whole number is missing instead.
     for column in NUMBER_COLUMNS:
         if column in df.columns:
-            df[column] = pd.to_numeric(df[column], errors='coerce')
+            df[column] = whole_numbers(df[column])
 
     occurred = parse_feed_timestamps(df['incident_occurred_at'])
     df['incident_occurred_at'] = occurred.dt.tz_convert(local_timezone).dt.tz_localize(None)

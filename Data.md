@@ -66,13 +66,13 @@ The application implements several data quality measures:
 - **Geographic Filtering**: Latitude (42.0-43.0), Longitude (-84.0 to -82.0)
 - **Local Time**: `incident_occurred_at` is converted from UTC to Detroit time (`America/Detroit`); `date` and `incident_year` are derived from the local time
 - **Temporal Filtering**: Data from 2018-01-01 (local time) onwards; incidents dated after the current day are dropped
-- **Unreadable Timestamps**: Rows whose timestamp cannot be read are dropped; if more than 1% are unreadable the load is refused
+- **Unreadable Timestamps**: Rows whose timestamp cannot be read are dropped; if more than 1% are unreadable the load is refused. A timestamp that is empty or only padding is missing, not unreadable: the row is dropped and does not count towards the 1%
 - **Invalid Bytes**: A byte that is not valid UTF-8 is replaced with `�` instead of failing the load
 - **Text Cleanup**: Trailing padding is trimmed from category, description, status, neighborhood and intersection values; a value that is only padding is treated as missing
-- **Day and Hour Numbers**: `incident_day_of_week` and `incident_hour_of_day` are read as numbers; a value that is not a number is treated as missing
-- **Quality Control**: Removes records with missing, non-numeric or out-of-range coordinates; a feed left with no rows is treated as a failed load
+- **Day and Hour Numbers**: `incident_day_of_week` and `incident_hour_of_day` are read as whole numbers; a value that is not one (text, a fraction) is treated as missing
+- **Quality Control**: Removes records with missing, non-numeric or out-of-range coordinates, from every figure and not only from the map; a feed left with no rows is treated as a failed load
 - **Real-time Exclusion**: Excludes the feed's last day, and anything dated after it, to avoid incomplete data. The last day is the latest one with at least 10% of a typical (median) day's incidents, so a lone row with a mistyped later date is not taken for it
-- **Categorical Formatting**: Zip codes, precincts and districts are read as numeric codes; rows without a valid whole-number code are left out of charts that group by them (the pivot says how many)
+- **Categorical Formatting**: Zip codes, precincts and districts are read as numeric codes; rows without a valid code (a whole number above zero, written as a plain number) are left out of charts that group by them (the pivot says how many)
 
 ## Data Quality Notes
 

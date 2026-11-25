@@ -105,17 +105,33 @@ def counts_chart(counts: pd.Series, accent: str) -> None:
     st.plotly_chart(fig, width="stretch")
 
 
+def sticky_selectbox(label: str, options: list, key: str):
+    """A sidebar selectbox that keeps its choice when its options change.
+
+    Streamlit starts a widget afresh when its list of options changes, as it
+    does when a refresh brings a new category or year: the choice would jump
+    back to "All" and the page would show everything in its place. Writing the
+    choice back under the widget's key before drawing it carries it over. A
+    choice that is no longer offered falls back to the first option.
+    """
+    previous = st.session_state.get(key, options[0])
+    st.session_state[key] = previous if previous in options else options[0]
+    return st.sidebar.selectbox(label, options, key=key)
+
+
 def setup_sidebar(categories: list[str], years: list[int]) -> tuple[str, int | str]:
     """Set up sidebar filters and return the selected category and year."""
     st.sidebar.header("Filters")
-    selected_category = st.sidebar.selectbox("Offense Category", ["All"] + sorted(categories))
-    selected_year = st.sidebar.selectbox("Year", ["All"] + sorted(years))
+    selected_category = sticky_selectbox("Offense Category", ["All"] + sorted(categories), "category_filter")
+    selected_year = sticky_selectbox("Year", ["All"] + sorted(years), "year_filter")
     return selected_category, selected_year
 
 
 def overview_page() -> None:
     """Render the Overview page content."""
-    df_filtered = st.session_state.get("df_filtered")
+    # The data main() lends this run
+    run_data = st.session_state.get("run_data", {})
+    df_filtered = run_data.get("df_filtered")
     selected_category = st.session_state.get("selected_category", "All")
     selected_year = st.session_state.get("selected_year", "All")
     data_end_date = st.session_state.get("data_end_date")
@@ -140,10 +156,17 @@ def overview_page() -> None:
     # every year together and for the current year, not for a past year.
     incidents_delta, avg_delta = None, None
     if selected_year in ("All", data_end_date.year):
-        incidents_delta, avg_delta = compute_yoy_deltas(st.session_state["df_all_years"], data_end_date)
-    delta_help = (
-        "The change compares this year, from 1 January to the last day of data, "
-        "with the same days of last year."
+        incidents_delta, avg_delta = compute_yoy_deltas(run_data["df_all_years"], data_end_date)
+    # The change is explained only where one is shown (both deltas come together)
+    delta_help = None
+    if incidents_delta is not None:
+        delta_help = (
+            "The change compares this year, from 1 January to the last day of data, "
+            "with the same days of last year."
+        )
+    total_help = (
+        "Counts offenses: a report with several charges is counted once per charge. "
+        "Incidents with no coordinates, or with coordinates outside the Detroit area, are left out."
     )
 
     # More crime is bad news, so increases are shown in red (inverse colors).
@@ -151,7 +174,7 @@ def overview_page() -> None:
         st.metric(
             "Total Incidents", f"{len(df_filtered):,}",
             delta=incidents_delta, delta_color="inverse",
-            help="Counts offenses: a report with several charges is counted once per charge. " + delta_help,
+            help=f"{total_help} {delta_help}" if delta_help else total_help,
         )
     with col2:
         st.metric(
@@ -262,9 +285,6 @@ def main() -> None:
     period_start, period_end = selection_period(selected_year, data_start_date, data_end_date)
 
     # Store in session state for child pages
-    st.session_state["df_filtered"] = df_filtered
-    # The category selection across every year, which the forecast is fitted on
-    st.session_state["df_all_years"] = df_all_years
     st.session_state["selected_category"] = selected_category
     st.session_state["selected_year"] = selected_year
     st.session_state["category_order"] = category_order
@@ -274,7 +294,22 @@ def main() -> None:
     st.session_state["period_start"] = period_start
     st.session_state["period_end"] = period_end
 
-    pg.run()
+    # The data itself is lent to the page for this run only, in a holder that
+    # is emptied when the run ends. Session state lasts as long as the browser
+    # tab stays open: left there, every idle tab would keep its own copy of a
+    # selection in memory, and after a refresh the whole previous dataset.
+    run_data = {
+        "df_filtered": df_filtered,
+        # The category selection across every year, which the forecast is fitted on
+        "df_all_years": df_all_years,
+    }
+    st.session_state["run_data"] = run_data
+    try:
+        pg.run()
+    finally:
+        # Through this reference, not through session state: once a page has
+        # called st.stop(), touching session state only stops the script again
+        run_data.clear()
 
 
 if __name__ == "__main__":
