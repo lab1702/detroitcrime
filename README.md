@@ -79,8 +79,9 @@ The application will be available at `http://localhost:8501`
 
 1. Build and run using Docker Compose:
 ```bash
-docker-compose up --build
+docker compose up --build
 ```
+(With the older standalone Compose, the command is `docker-compose up --build`.)
 
 The application will be available at `http://localhost:8502`
 
@@ -182,7 +183,7 @@ The application implements several data quality measures:
 - Dependencies are pinned to tested version ranges in `requirements.txt`; the Docker image uses `python:3.15`
 - Run the tests with `pip install -r requirements-dev.txt` then `pytest`
 - The page scripts are in `views/` and must not be moved to a folder named `pages/`. Streamlit runs the scripts of a `pages/` folder on their own until `st.navigation` has been called once, so the first visitor to a new server who arrived on a page's URL would get that page without the data `app.py` loads
-- The Docker image runs the app as an unprivileged user (`app`)
+- The Docker image runs the app as an unprivileged user (`app`), which can read the app's files but not change them. The Dockerfile sets the file modes itself, because files copied from a Windows checkout (a build under WSL) would otherwise be writable by everyone
 - Follows Streamlit best practices for layout and caching
 - Implements error handling for API failures
 - Responsive design with wide layout configuration
