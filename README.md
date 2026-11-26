@@ -36,7 +36,7 @@ An interactive web application for visualizing and analyzing Detroit crime incid
 ## Data Source
 
 The application fetches real-time crime incident data from the Detroit Open Data Portal:
-- **API Endpoint**: `https://data.detroitmi.gov/api/download/v1/items/8e532daeec1149879bd5e67fdd9c8be0/csv`
+- **API Endpoint**: `https://data.detroitmi.gov/api/download/v1/items/8e532daeec1149879bd5e67fdd9c8be0/csv?layers=0`
 - **Format**: CSV
 - **Update Frequency**: Real-time (cached for 24 hours in application)
 - **Coverage**: Crime incidents from 2018 onwards
@@ -53,7 +53,7 @@ The application fetches real-time crime incident data from the Detroit Open Data
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
+git clone https://github.com/lab1702/detroitcrime.git
 cd detroitcrime
 ```
 
