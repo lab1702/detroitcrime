@@ -127,6 +127,29 @@ def holiday_label(name: str) -> str:
     return (kept or short[:MAX_HOLIDAY_LABEL_LENGTH - 1]) + "…"
 
 
+def label_levels(positions: Iterable[float], widths: Iterable[float]) -> list[int]:
+    """The level each of a row of labels goes on, so that none runs into another.
+
+    A label is centred on its position and is as wide as its width, in the
+    same unit. Taken in the order given, which is that of their positions,
+    each goes on the lowest level (0 is the lowest) where the label before it
+    has ended by the time it starts, and on a new level above the others when
+    there is none. Going by a label's place in the row instead (every fourth
+    on the same level) puts two long ones side by side when they are close.
+    """
+    taken_to: list[float] = []  # where the last label on each level ends
+    levels = []
+    for position, width in zip(positions, widths):
+        start, end = position - width / 2, position + width / 2
+        level = next((i for i, taken in enumerate(taken_to) if taken <= start), len(taken_to))
+        if level == len(taken_to):
+            taken_to.append(end)
+        else:
+            taken_to[level] = end
+        levels.append(level)
+    return levels
+
+
 # ── Download ─────────────────────────────────────────────────────────────────
 
 # Responses worth another attempt: rate limiting and trouble on the server

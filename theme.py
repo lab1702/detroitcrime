@@ -16,9 +16,13 @@ TEAL_ACCENT = "#00bfa5"      # Secondary positive
 CARD_BG = "#1a1f2e"
 CARD_BORDER = "#2d3548"
 
-# Key of the container around the KPI card that shows a category name.
-# Streamlit gives a keyed container the class "st-key-<key>", which the CSS
-# below styles that one card by.
+# Pixels left clear above the plot of a chart (see `apply_dark_plotly`)
+PLOT_TOP_MARGIN = 40
+
+# Keys of two containers on the Overview. Streamlit gives a keyed container
+# the class "st-key-<key>", which the CSS below styles them by: the row of
+# KPI cards, and the one card in it that shows a category name.
+KPI_ROW_KEY = "kpi_cards"
 CATEGORY_CARD_KEY = "category_card"
 
 CUSTOM_CSS = """
@@ -41,6 +45,25 @@ CUSTOM_CSS = """
         color: #e0e0e0;
         font-size: 1.8rem;
         font-weight: 700;
+    }
+    /* The row of KPI cards is laid out by the room it has itself, which is
+       the window less the sidebar: four across, two by two, or one to a row.
+       Four across in a window of laptop width leaves a card too narrow for
+       its figures, and Streamlit cuts them off ("751,…"). Above 55rem each
+       card has room for the longest thing on one, the span of dates under
+       Date Range; above 27rem two side by side have. */
+    .st-key-kpi_cards {
+        container-type: inline-size;
+    }
+    @container (max-width: 55rem) {
+        .st-key-kpi_cards div[data-testid="stColumn"] {
+            flex-basis: calc(50% - 1rem);
+        }
+    }
+    @container (max-width: 27rem) {
+        .st-key-kpi_cards div[data-testid="stColumn"] {
+            flex-basis: 100%;
+        }
     }
     /* The card that shows a category name: smaller, and wrapped over two
        lines if need be, where a long name would otherwise be cut off */
@@ -101,7 +124,8 @@ def _has_default_color(color) -> bool:
     return isinstance(color, str) and color in (colorway or px.colors.qualitative.Plotly)
 
 
-def apply_dark_plotly(fig: go.Figure, accent_color: str = BLUE_ACCENT) -> go.Figure:
+def apply_dark_plotly(fig: go.Figure, accent_color: str = BLUE_ACCENT,
+                      top_margin: int = PLOT_TOP_MARGIN) -> go.Figure:
     """Apply dark theme to a Plotly figure with an accent color.
 
     Bar and line traces that still have their default color are drawn in the
@@ -110,6 +134,10 @@ def apply_dark_plotly(fig: go.Figure, accent_color: str = BLUE_ACCENT) -> go.Fig
     Args:
         fig: Plotly figure to style.
         accent_color: Primary accent color for the chart.
+        top_margin: Pixels left clear above the plot. Every chart gets the
+            same, whatever the figure came with (Plotly Express sets its
+            own), unless it is given here: the forecast puts its holidays'
+            names above its plot.
 
     Returns:
         The same figure with dark theme applied.
@@ -125,7 +153,7 @@ def apply_dark_plotly(fig: go.Figure, accent_color: str = BLUE_ACCENT) -> go.Fig
             tickfont=dict(color="#c0c8d4"),
             title=dict(font=dict(color="#c0c8d4")),
         ),
-        margin=dict(l=20, r=20, t=40, b=20),
+        margin=dict(l=20, r=20, t=top_margin, b=20),
     )
     # Apply accent color to bar and line traces that have no color of their own
     for trace in fig.data:

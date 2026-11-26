@@ -20,7 +20,8 @@ from urllib3.exceptions import ReadTimeoutError
 
 import utils
 from conftest import clean_feed, make_page_state, make_raw_feed
-from constants import DAY_LABELS, MAX_SCATTER_POINTS
+from constants import CHART_HEIGHT, DAY_LABELS, HOLIDAY_LABEL_DAYS_PER_CHARACTER, MAX_SCATTER_POINTS
+from theme import KPI_ROW_KEY, PLOT_TOP_MARGIN
 
 ROOT = Path(__file__).resolve().parent.parent
 TIMEOUT = 300  # the Trends page fits a Prophet model
@@ -182,6 +183,28 @@ def test_overview_kpis(overview, clean_df):
     assert abs(float(metrics["Avg Daily"].delta.rstrip("%"))) < 5
     # The date span is shown as plain text, not as a rising delta
     assert metrics["Date Range"].delta == f"{clean_df['date'].min()} to {clean_df['date'].max()}"
+
+
+def keyed_block(at: AppTest, key: str):
+    """The container the page gave `key`, wherever on the page it is."""
+    def search(node):
+        for child in getattr(node, "children", {}).values():
+            if getattr(child, "key", None) == key:
+                return child
+            found = search(child)
+            if found is not None:
+                return found
+        return None
+
+    return search(at.main)
+
+
+def test_kpi_cards_are_in_the_row_the_theme_lays_out(overview):
+    # Four across in a window of laptop width, the cards cut their figures off
+    # ("751,…"). The stylesheet lays the row out by the room it has, and finds
+    # it by this key: all four cards have to be under it.
+    row = keyed_block(overview, KPI_ROW_KEY)
+    assert [m.label for m in row.metric] == ["Total Incidents", "Date Range", "Avg Daily", "Most Common"]
 
 
 def test_overview_footer_reports_data_coverage(overview, clean_df):
@@ -962,13 +985,55 @@ def test_heatmap_with_every_incident_in_it_has_no_note(page_state):
 
 def test_forecast_names_each_holiday_once_and_in_full(page_state):
     at = run_page("2_Trends.py", page_state)
-    names = [note["text"] for note in forecast_figure(at)["layout"]["annotations"]]
+    # In the order of their days (they are drawn in another: see the next test)
+    notes = sorted(forecast_figure(at)["layout"]["annotations"], key=lambda note: note["x"])
+    names = [note["text"] for note in notes]
     # The year after 30 March 2026. 4 July 2026 is a Saturday: the Friday it is
     # observed on carries no second "Independence Day" next to the first.
     assert names == [
         "Memorial Day", "Juneteenth", "Independence Day", "Labor Day", "Columbus Day", "Veterans Day",
         "Thanksgiving Day", "Christmas Day", "New Year's Day", "MLK Day", "Presidents' Day",
     ]
+
+
+def test_holiday_names_on_the_forecast_do_not_run_into_each_other(page_state):
+    at = run_page("2_Trends.py", page_state)
+    layout = forecast_figure(at)["layout"]
+    notes = layout["annotations"]
+
+    # Each name stands over its own line at the top of the plot, wherever the
+    # forecast runs: set by its values, the levels closed up on one another
+    # when it ran flat
+    assert {(note["yref"], note["y"], note["ax"]) for note in notes} == {("paper", 1, 0)}
+
+    # Two names on one level are further apart than they are wide. Thanksgiving
+    # and Presidents' Day, 81 days apart, used to share one (every fourth name
+    # did) and were drawn across each other in a window of laptop width.
+    def days_wide(note: dict) -> int:
+        return (len(note["text"]) + 3) * HOLIDAY_LABEL_DAYS_PER_CHARACTER
+
+    by_day = sorted(notes, key=lambda note: note["x"])
+    for i, left in enumerate(by_day):
+        for right in by_day[i + 1:]:
+            if left["ay"] == right["ay"]:
+                apart = (pd.Timestamp(right["x"]) - pd.Timestamp(left["x"])).days
+                assert apart >= (days_wide(left) + days_wide(right)) / 2, (left["text"], right["text"])
+    level = {note["text"]: note["ay"] for note in notes}
+    assert level["Thanksgiving Day"] != level["Presidents' Day"]
+    # Names with room beside them are not stacked for nothing
+    assert level["Memorial Day"] == level["Labor Day"] == max(level.values())
+
+    # The highest are drawn first: the arrow from a name to its line then runs
+    # behind the names below it, not across them
+    assert [note["ay"] for note in notes] == sorted(note["ay"] for note in notes)
+
+    # There is room above the plot for the highest of them (a name is 14 high),
+    # and the plot itself is as tall as on the other charts
+    assert layout["margin"]["t"] >= -min(level.values()) + 7
+    assert layout["height"] - layout["margin"]["t"] == CHART_HEIGHT - PLOT_TOP_MARGIN
+    # Only the forecast has that room: the other charts have what every chart has
+    others = [figure["layout"] for figure in plotly_figures(at) if "annotations" not in figure["layout"]]
+    assert [other["margin"]["t"] for other in others] == [PLOT_TOP_MARGIN] * 3
 
 
 def test_holiday_on_the_last_day_of_data_is_not_marked_on_the_forecast():
@@ -1062,14 +1127,14 @@ def test_part_years_are_marked_on_the_year_over_year_chart(page_state):
     assert values(bars["x"]) == [2024, 2025, 2026]
     assert values(bars["marker"]["opacity"]) == [0.45, 1, 0.45]
     assert [c.value for c in at.caption] == [
-        "Lighter bars cover part of a year: 2024 (from 1 Jun), 2026 (to 30 Mar)."
+        "Fainter bars cover part of a year: 2024 (from 1 Jun), 2026 (to 30 Mar)."
     ]
 
-    # A whole year on its own is neither lighter nor explained
+    # A whole year on its own is neither fainter nor explained
     at = run_page("2_Trends.py", make_page_state(page_state["df_all_years"], year=2025))
     yoy = next(f for f in plotly_figures(at) if f["data"][0]["type"] == "bar")
     assert values(yoy["data"][0]["marker"]["opacity"]) == [1]
-    assert not any("Lighter bars" in c.value for c in at.caption)
+    assert not any("Fainter bars" in c.value for c in at.caption)
 
 
 def test_current_year_is_marked_as_part_of_one_before_it_is_projected():
@@ -1082,7 +1147,7 @@ def test_current_year_is_marked_as_part_of_one_before_it_is_projected():
     assert values(bars["x"]) == [2024, 2025, 2026]
     assert values(bars["marker"]["opacity"]) == [0.45, 1, 0.45]
     assert [c.value for c in at.caption] == [
-        "Lighter bars cover part of a year: 2024 (from 1 Jun), 2026 (to 9 Feb)."
+        "Fainter bars cover part of a year: 2024 (from 1 Jun), 2026 (to 9 Feb)."
     ]
 
 
@@ -1094,7 +1159,7 @@ def test_projection_counts_from_the_first_day_of_data():
     yoy = next(f for f in plotly_figures(at) if f["data"][0]["type"] == "bar")
     actual, projected = yoy["data"]
     assert projected["base"][0] + projected["y"][0] == pytest.approx(8 * 365)
-    assert [c.value for c in at.caption] == ["Lighter bars cover part of a year: 2026 (1 Feb to 29 Jun)."]
+    assert [c.value for c in at.caption] == ["Fainter bars cover part of a year: 2026 (1 Feb to 29 Jun)."]
 
 
 def test_forecast_failure_is_reported_and_not_cached(page_state, monkeypatch, caplog):

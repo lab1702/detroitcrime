@@ -15,10 +15,13 @@ from urllib3.exceptions import ReadTimeoutError
 
 import utils
 from constants import REQUIRED_COLUMNS
-from theme import BLUE_ACCENT, CATEGORY_CARD_KEY, CUSTOM_CSS, RED_ACCENT, apply_dark_plotly
+from theme import (
+    BLUE_ACCENT, CATEGORY_CARD_KEY, CUSTOM_CSS, KPI_ROW_KEY, PLOT_TOP_MARGIN, RED_ACCENT, apply_dark_plotly,
+)
 from utils import (
     DataNotReadyError, LoadFailedError, RefreshingCache, clean_and_filter_data, code_labels,
-    compute_yoy_deltas, daily_incident_counts, day_labels, format_change, format_daily_rate, holiday_label, numeric_codes, part_year_note, partial_years, project_full_year,
+    compute_yoy_deltas, daily_incident_counts, day_labels, format_change, format_daily_rate, holiday_label,
+    label_levels, numeric_codes, part_year_note, partial_years, project_full_year,
     refuse_shrunken_refresh, safe_load_data_from_url, same_day_last_year, selection_period,
 )
 
@@ -413,6 +416,34 @@ class TestCategoricalFormatting:
         assert all(len(holiday_label(name)) <= 16 for name in ("A Day Exactly Sixteen", "Sixteen Letters!!", "Day"))
 
 
+class TestLabelLevels:
+    def test_labels_with_room_between_them_share_the_lowest_level(self):
+        assert label_levels([0, 100, 200], [50, 50, 50]) == [0, 0, 0]
+        # One may start where the last one ends
+        assert label_levels([0, 50], [50, 50]) == [0, 0]
+        assert label_levels([], []) == []
+
+    def test_labels_that_would_touch_go_one_above_the_other(self):
+        assert label_levels([0, 49], [50, 50]) == [0, 1]
+        # Thanksgiving to Presidents' Day: five names in twelve weeks, each
+        # some ten weeks wide
+        assert label_levels([0, 29, 36, 53, 81], [95, 80, 85, 50, 90]) == [0, 1, 2, 3, 4]
+
+    def test_level_is_used_again_once_its_last_label_has_ended(self):
+        assert label_levels([0, 30, 100, 130], [60, 60, 60, 60]) == [0, 1, 0, 1]
+        # The lowest that is free, not the one after the last used
+        assert label_levels([0, 10, 20, 100], [60, 60, 60, 60]) == [0, 1, 2, 0]
+
+    def test_level_goes_by_distance_not_by_place_in_the_row(self):
+        # Every fourth label used to share a level. The first and the fifth
+        # here are 81 apart and 95 wide: side by side, one ran across the other.
+        levels = label_levels([0, 29, 36, 53, 81], [95] * 5)
+        assert levels[0] != levels[4]
+        # A short one fits where a long one would not
+        assert label_levels([0, 60], [95, 95]) == [0, 1]
+        assert label_levels([0, 60], [95, 25]) == [0, 0]
+
+
 class TestDailyRate:
     def test_one_decimal_from_one_a_day_up(self):
         assert format_daily_rate(20.04) == "20.0"
@@ -451,6 +482,14 @@ class TestTheme:
     def test_category_card_is_styled_by_the_key_the_page_gives_it(self):
         # The page and the stylesheet each name the card; they have to agree
         assert f".st-key-{CATEGORY_CARD_KEY} " in CUSTOM_CSS
+
+    def test_kpi_row_is_laid_out_by_the_key_the_page_gives_it(self):
+        # As for the card. The row is laid out by its own width, not the
+        # window's: how much of the window the sidebar takes is not the row's to know.
+        assert f".st-key-{KPI_ROW_KEY} {{" in CUSTOM_CSS
+        assert CUSTOM_CSS.count(f".st-key-{KPI_ROW_KEY} div[data-testid=\"stColumn\"]") == 2
+        assert "container-type: inline-size" in CUSTOM_CSS
+        assert CUSTOM_CSS.count("@container (max-width:") == 2
 
 
 CSV_BODY = b"latitude,offense_category\n42.3,ARSON\n42.4,FRAUD\n"
@@ -1368,3 +1407,11 @@ class TestAccentColors:
         apply_dark_plotly(fig, BLUE_ACCENT)
         assert fig.data[0].marker.color == BLUE_ACCENT
         assert fig.data[1].marker.color == "rgba(255, 165, 0, 0.3)"
+
+    def test_every_chart_has_the_same_room_above_its_plot_unless_told_otherwise(self):
+        # Plotly Express comes with a top margin of its own (60), which is not kept
+        fig = px.line(x=[1, 2], y=[3, 4])
+        assert fig.layout.margin.t != PLOT_TOP_MARGIN
+        assert apply_dark_plotly(fig).layout.margin.t == PLOT_TOP_MARGIN
+        # The forecast puts its holidays' names above its plot, and says how much room they need
+        assert apply_dark_plotly(px.line(x=[1, 2], y=[3, 4]), top_margin=99).layout.margin.t == 99

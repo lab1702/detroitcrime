@@ -23,7 +23,9 @@ from utils import (
     clean_and_filter_data, compute_yoy_deltas, daily_incident_counts, dataset_cache, format_daily_rate,
     is_timeout, is_transient_error, refuse_stale_feed, selection_period,
 )
-from theme import inject_css, apply_dark_plotly, BLUE_ACCENT, CATEGORY_CARD_KEY, GREEN_ACCENT, RED_ACCENT
+from theme import (
+    inject_css, apply_dark_plotly, BLUE_ACCENT, CATEGORY_CARD_KEY, GREEN_ACCENT, KPI_ROW_KEY, RED_ACCENT,
+)
 
 # Configure page
 st.set_page_config(
@@ -188,7 +190,11 @@ def overview_page() -> None:
         st.stop()
 
     # ── KPI Metrics ─────────────────────────────────────────────────────────────
-    col1, col2, col3, col4 = st.columns(4)
+    # The key lets the theme lay the four cards out by the room there is for
+    # them: side by side in a narrower window their figures are cut off (see
+    # theme.py)
+    with st.container(key=KPI_ROW_KEY):
+        col1, col2, col3, col4 = st.columns(4)
     # Rates are measured over the whole selected period, not from the first to
     # the last incident, so a rarely reported category is not overstated.
     period_start: date = st.session_state["period_start"]

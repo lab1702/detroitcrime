@@ -160,6 +160,13 @@ HOLIDAY_SHORT_NAMES = {
     "Washington's Birthday": "Presidents' Day",
     "Juneteenth National Independence Day": "Juneteenth",
 }
+# Names that would run into each other are set at different heights. How many
+# days of the chart a name covers depends on how wide the chart is drawn,
+# which the server is not told. Each character is taken to cover this many,
+# as it does where the plot is 365 pixels wide: in a window of 1024 with the
+# sidebar open. Wider than that the names have room to spare; in a narrower
+# window they can still touch.
+HOLIDAY_LABEL_DAYS_PER_CHARACTER = 5
 
 # Day of week labels. The feed numbers days ISO-style: 1=Monday ... 7=Sunday.
 DAY_LABELS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']

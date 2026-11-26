@@ -11,16 +11,24 @@ from prophet.make_holidays import make_holidays_df
 
 from constants import (
     CHART_HEIGHT, MIN_FORECAST_DAYS, FORECAST_PERIODS, HISTORICAL_MONTHS,
-    FORECAST_CACHE_TTL, YOY_CACHE_TTL, DAY_LABELS, COLOR_SCALE_HEATMAP,
+    FORECAST_CACHE_TTL, YOY_CACHE_TTL, DAY_LABELS, COLOR_SCALE_HEATMAP, HOLIDAY_LABEL_DAYS_PER_CHARACTER,
 )
-from utils import daily_incident_counts, holiday_label, part_year_note, partial_years, project_full_year
-from theme import inject_css, apply_dark_plotly, BLUE_ACCENT
+from utils import (
+    daily_incident_counts, holiday_label, label_levels, part_year_note, partial_years, project_full_year,
+)
+from theme import inject_css, apply_dark_plotly, BLUE_ACCENT, PLOT_TOP_MARGIN
 
 # Named here: a page script's own `__name__` says nothing about which page it is
 logger = logging.getLogger("views.trends")
 
 # How solid the bar of a year the data covers only in part is drawn (1 is a whole year)
 PART_YEAR_OPACITY = 0.45
+
+# Holiday names on the forecast stand above the plot on levels, in pixels:
+# from the top of the plot to the middle of a name on the lowest level, and
+# from one level to the next (a name is 14 high)
+HOLIDAY_FIRST_LEVEL = 14
+HOLIDAY_LEVEL_HEIGHT = 17
 
 
 @st.cache_data(ttl=YOY_CACHE_TTL)
@@ -33,7 +41,7 @@ def create_yoy(df, start, as_of):
 
     fig = px.bar(yearly, x="year", y="count", labels={"year": "Year", "count": "Incidents"})
 
-    # A year the data covers only in part is drawn lighter (the caption
+    # A year the data covers only in part is drawn fainter (the caption
     # under the chart says which part). Its bar would otherwise be read as
     # a fall: the current year always is one, and has no projection in its
     # first weeks.
@@ -189,43 +197,50 @@ def create_forecast(df: pd.DataFrame, start, end) -> Optional[go.Figure]:
     forecast_holidays = holidays[
         (holidays["ds"] > forecast_start) & (holidays["ds"] <= future_dates["ds"].max())
         & ~holidays["holiday"].str.endswith("(observed)")
-    ]
+    ].sort_values("ds")
+    top_margin = PLOT_TOP_MARGIN
     if not forecast_holidays.empty:
-        y_max = future_dates["yhat"].max()
-        y_min = future_dates["yhat"].min()
-        y_range = y_max - y_min
-        forecast_holidays = forecast_holidays.sort_values("ds")
+        for day in forecast_holidays["ds"]:
+            fig.add_vline(x=day, line_dash="dash", line_color="rgba(0, 200, 83, 0.4)", line_width=1)
 
-        for i, (_, holiday) in enumerate(forecast_holidays.iterrows()):
-            fig.add_vline(
-                x=holiday["ds"],
-                line_dash="dash",
-                line_color="rgba(0, 200, 83, 0.4)",
-                line_width=1,
-            )
-            level = i % 4
-            y_pos = y_max - (y_range * 0.1) - level * (y_range * 0.25)
+        # The names stand above the plot, each over its own line, where they
+        # cover none of the forecast. Those that would run into each other
+        # are put on different levels: a name is taken to be as wide as its
+        # characters and three more, for the box around it and a gap.
+        names = [holiday_label(name) for name in forecast_holidays["holiday"]]
+        levels = label_levels(
+            (forecast_holidays["ds"] - forecast_start).dt.days,
+            [(len(name) + 3) * HOLIDAY_LABEL_DAYS_PER_CHARACTER for name in names],
+        )
+        # The highest are drawn first: the arrow from a name down to its line
+        # then runs behind the names on the levels below, not across them
+        for level, day, name in sorted(zip(levels, forecast_holidays["ds"], names), key=lambda label: -label[0]):
             fig.add_annotation(
-                x=holiday["ds"],
-                y=y_pos,
-                text=holiday_label(holiday["holiday"]),
+                x=day,
+                y=1,
+                yref="paper",  # the top of the plot, whatever the forecast comes to
+                text=name,
                 showarrow=True,
                 arrowhead=1,
                 arrowsize=0.7,
                 arrowwidth=1,
                 arrowcolor="rgba(0, 200, 83, 0.6)",
                 ax=0,
-                ay=-25 - level * 25,
+                ay=-(HOLIDAY_FIRST_LEVEL + level * HOLIDAY_LEVEL_HEIGHT),
                 bgcolor="rgba(26, 31, 46, 0.95)",
                 bordercolor="rgba(0, 200, 83, 0.6)",
                 borderwidth=1,
                 font=dict(size=8, color="#c0c8d4"),
             )
+        # Room above the plot for every level, to the top of the highest name
+        top_margin = max(top_margin, HOLIDAY_FIRST_LEVEL + (max(levels) + 1) * HOLIDAY_LEVEL_HEIGHT)
 
     fig.update_layout(
         xaxis_title="Date",
         yaxis_title="Incidents",
-        height=CHART_HEIGHT,
+        # The plot itself stays as tall as on the other charts
+        margin_t=top_margin,
+        height=CHART_HEIGHT + top_margin - PLOT_TOP_MARGIN,
     )
     return fig
 
@@ -283,14 +298,15 @@ def render() -> None:
         apply_dark_plotly(fig_yoy, BLUE_ACCENT)
         st.plotly_chart(fig_yoy, width="stretch")
 
-        # Which part of a year each lighter bar stands for
+        # Which part of a year each fainter bar stands for. Not "lighter": on
+        # the dark background a bar that is less solid is the darker one.
         years_shown = set(df_filtered["incident_year"].unique())
         part_years = partial_years(data_start_date, data_end_date)
         part_notes = [
             f"{year} ({part_year_note(*part_years[year])})" for year in sorted(part_years) if year in years_shown
         ]
         if part_notes:
-            st.caption(f"Lighter bars cover part of a year: {', '.join(part_notes)}.")
+            st.caption(f"Fainter bars cover part of a year: {', '.join(part_notes)}.")
 
     with right:
         st.subheader("Hour of Day × Day of Week")
@@ -327,7 +343,8 @@ def render() -> None:
                 f"{MIN_FORECAST_DAYS} days."
             )
         else:
-            apply_dark_plotly(forecast_fig, BLUE_ACCENT)
+            # The room the forecast has set above its plot holds its holidays' names
+            apply_dark_plotly(forecast_fig, BLUE_ACCENT, top_margin=forecast_fig.layout.margin.t)
             st.plotly_chart(forecast_fig, width="stretch")
 
 
